@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MCP Proxy — Envoy Cluster Rewriting Flow</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem;
+    }
+    h1 {
+      font-size: 1.6rem;
+      font-weight: 600;
+      margin-bottom: 0.5rem;
+      color: #f1f5f9;
+    }
+    .subtitle {
+      color: #94a3b8;
+      margin-bottom: 2rem;
+      font-size: 0.95rem;
+    }
+    .diagram-section {
+      width: 100%;
+      max-width: 1100px;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 2rem;
+      margin-bottom: 2rem;
+    }
+    .diagram-section h2 {
+      font-size: 1.15rem;
+      color: #38bdf8;
+      margin-bottom: 1.25rem;
+      padding-bottom: 0.5rem;
+      border-bottom: 1px solid #334155;
+    }
+    .mermaid {
+      display: flex;
+      justify-content: center;
+    }
+    .mermaid svg {
+      max-width: 100%;
+      height: auto;
+    }
+    .legend {
+      margin-top: 2rem;
+      width: 100%;
+      max-width: 1100px;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 1.5rem 2rem;
+    }
+    .legend h3 { color: #38bdf8; margin-bottom: 0.75rem; font-size: 1rem; }
+    .legend ul { list-style: none; }
+    .legend li {
+      padding: 0.3rem 0;
+      font-size: 0.9rem;
+      color: #cbd5e1;
+    }
+    .legend li code {
+      background: #334155;
+      padding: 0.15rem 0.45rem;
+      border-radius: 4px;
+      font-size: 0.85rem;
+      color: #7dd3fc;
+    }
+  </style>
+</head>
+<body>
+
+<h1>MCP Proxy — Envoy Cluster IP Rewriting Flow</h1>
+<p class="subtitle">How requests reach the local MCP proxy via dummy-IP rewriting in the AI Gateway extension server</p>
+
+<!-- Diagram 1: Control-Plane — xDS Cluster Rewriting -->
+<div class="diagram-section">
+  <h2>1. Control-Plane: xDS Cluster Rewriting</h2>
+  <pre class="mermaid">
+%%{init: {"theme": "dark", "themeVariables": {"fontSize": "14px"}}}%%
+flowchart TB
+    subgraph K8s["Kubernetes Control Plane"]
+        MCPRoute["MCPRoute CR\n(aigateway.envoyproxy.io/v1alpha1)"]
+        Controller["MCPRoute Controller\n(mcp_route.go)"]
+        Backend["Backend resource\nIP: 192.0.2.42:9856\n(RFC 5737 dummy)"]
+        HTTPRoute["HTTPRoute resources\n• rule/0 — /mcp (main MCP path)\n• rule/1 — /.well-known/oauth-protected-resource/mcp\n• rule/2 — /.well-known/oauth-authorization-server/mcp\n• rule/3 — /.well-known/openid-configuration/mcp"]
+    end
+
+    subgraph EG["Envoy Gateway"]
+        Translate["Gateway API → xDS Translation"]
+        EDSCluster["EDS Clusters\n(name contains 'ai-eg-mcp-main-')\nendpoint via EDS → 192.0.2.42:9856"]
+    end
+
+    subgraph ExtServer["AI Gateway Extension Server\n(mcproute.go)"]
+        ModifyCluster["modifyMCPGatewayGeneratedCluster()"]
+        HasDummy["hasMCPProxyDummyEndpoint()"]
+        NameCheck["Name filter:\ncontains 'ai-eg-mcp-main-'?"]
+        TypeCheck["Type check:\nEDS / eds_cluster_config?\nor LoadAssignment has 192.0.2.42?"]
+        Rewrite["Rewrite cluster →\nSTATIC  127.0.0.1:9856"]
+    end
+
+    MCPRoute -->|reconcile| Controller
+    Controller -->|creates| Backend
+    Controller -->|creates| HTTPRoute
+    HTTPRoute --> Translate
+    Backend --> Translate
+    Translate -->|produces| EDSCluster
+    EDSCluster -->|"xDS push (ADS)"| ModifyCluster
+    ModifyCluster --> NameCheck
+    NameCheck -->|yes| HasDummy
+    HasDummy --> TypeCheck
+    TypeCheck -->|match| Rewrite
+    Rewrite -->|"patched xDS\npushed to Envoy"| EnvoyNode["Envoy Proxy\n(static cluster → 127.0.0.1:9856)"]
+
+    style MCPRoute fill:#1e40af,stroke:#3b82f6,color:#fff
+    style Backend fill:#7c2d12,stroke:#ea580c,color:#fff
+    style EDSCluster fill:#7c2d12,stroke:#ea580c,color:#fff
+    style Rewrite fill:#065f46,stroke:#10b981,color:#fff
+    style EnvoyNode fill:#065f46,stroke:#10b981,color:#fff
+  </pre>
+</div>
+
+<!-- Diagram 2: Data-Plane — Request Flow -->
+<div class="diagram-section">
+  <h2>2. Data-Plane: Request Flow (after rewriting)</h2>
+  <pre class="mermaid">
+%%{init: {"theme": "dark", "themeVariables": {"fontSize": "14px"}}}%%
+sequenceDiagram
+    participant Client as Client / Browser
+    participant Envoy as Envoy Proxy<br/>(Ingress Gateway)
+    participant MCPProxy as MCP Proxy<br/>(127.0.0.1:9856)
+
+    Note over Client,MCPProxy: OAuth Metadata Discovery (path-based issuer)
+    Client->>Envoy: GET /.well-known/openid-configuration/mcp
+    Envoy->>Envoy: Route match → httproute/.../rule/3<br/>Adds x-ai-eg-mcp-oauth-metadata-type: authorization-server
+    Envoy->>Envoy: Cluster lookup → STATIC 127.0.0.1:9856
+    Envoy->>MCPProxy: Forward request (localhost)
+    MCPProxy->>MCPProxy: Check MCPOAuthMetadataTypeHeader<br/>→ serveOAuthMetadata()<br/>→ metadataTypeFromPath() → authorization-server<br/>→ buildDynamicAuthServerMetadata() from Host header
+    MCPProxy-->>Envoy: 200 OK (JSON metadata with full URLs)
+    Envoy-->>Client: 200 OK
+
+    Note over Client,MCPProxy: OAuth Protected Resource Metadata
+    Client->>Envoy: GET /.well-known/oauth-protected-resource/mcp
+    Envoy->>Envoy: Route match → httproute/.../rule/1<br/>Adds x-ai-eg-mcp-oauth-metadata-type: protected-resource
+    Envoy->>Envoy: Cluster lookup → STATIC 127.0.0.1:9856
+    Envoy->>MCPProxy: Forward request (localhost)
+    MCPProxy->>MCPProxy: serveOAuthMetadata()<br/>→ protected-resource<br/>→ Return pre-built ProtectedResourceMetadataJSON
+    MCPProxy-->>Envoy: 200 OK (JSON metadata)
+    Envoy-->>Client: 200 OK
+
+    Note over Client,MCPProxy: MCP Protocol (SSE / Streamable HTTP)
+    Client->>Envoy: POST /mcp (or GET for SSE)
+    Envoy->>Envoy: Route match → httproute/.../rule/0<br/>Adds x-ai-eg-mcp-route header
+    Envoy->>Envoy: Cluster lookup → STATIC 127.0.0.1:9856
+    Envoy->>MCPProxy: Forward request (localhost)
+    MCPProxy->>MCPProxy: Check MCPOAuthMetadataTypeHeader → empty<br/>→ Handle MCP JSON-RPC
+    MCPProxy-->>Envoy: Response / SSE stream
+    Envoy-->>Client: Response / SSE stream
+  </pre>
+</div>
+
+<!-- Legend -->
+<div class="legend">
+  <h3>Key Components</h3>
+  <ul>
+    <li><code>MCPRoute</code> — Custom resource defining MCP server routes and OAuth configuration</li>
+    <li><code>MCPRouteController</code> — Reconciles MCPRoute into HTTPRoute + Backend with dummy IP <code>192.0.2.42</code></li>
+    <li><code>Envoy Gateway</code> — Translates Gateway API resources into Envoy xDS configuration</li>
+    <li><code>Extension Server</code> — Intercepts xDS before delivery; rewrites MCP clusters to <code>127.0.0.1:9856</code></li>
+    <li><code>MCP Proxy</code> — Local sidecar on port <code>9856</code>; handles MCP JSON-RPC and serves OAuth metadata</li>
+    <li><code>ai-eg-mcp-main-</code> — Cluster name prefix used to identify MCP proxy clusters (<code>internalapi.MCPMainHTTPRoutePrefix</code>)</li>
+    <li><code>192.0.2.42</code> — RFC 5737 TEST-NET-2 dummy IP; never routable, used as a placeholder for the extension server to rewrite</li>
+    <li><code>x-ai-eg-mcp-oauth-metadata-type</code> — Header set by HTTPRoute filter to tell the MCP proxy which OAuth metadata to serve (<code>protected-resource</code> or <code>authorization-server</code>)</li>
+    <li><code>Path-based issuer</code> — When <code>oauth.issuer.path</code> is set, metadata requests are proxied to the MCP Proxy which dynamically builds full URLs from the Host header</li>
+    <li><code>URI-based issuer</code> — When <code>oauth.issuer.url</code> is set, metadata is served via DirectResponse HTTPRouteFilters with static JSON baked at controller time (not shown in data-plane diagram above)</li>
+  </ul>
+</div>
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'dark',
+    securityLevel: 'loose',
+    flowchart: { curve: 'basis', htmlLabels: true },
+    sequence: { mirrorActors: false }
+  });
+</script>
+</body>
+</html>

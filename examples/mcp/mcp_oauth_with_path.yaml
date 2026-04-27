@@ -1,0 +1,58 @@
+apiVersion: aigateway.envoyproxy.io/v1alpha1
+kind: MCPRoute
+metadata:
+  name: mcp-oauth-test
+  namespace: nai-admin-extensions
+  labels:
+    nai.nutanix.com/feature: mcp
+    # nai.nutanix.com/extauth: enabled
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: nai-ingress-gateway
+      namespace: nai-system
+
+  path: /enterpriseai/mcp/oauth-test
+  securityPolicy:
+    oauth:
+      issuer:
+        path: "/api/iam/authn/"
+        backendRef:
+          group: ""
+          kind: Service
+          name: iam-proxy
+          namespace: nai-system
+          port: 443
+      # audiences: []
+      # jwks:
+      #   remoteJWKS:
+      #     uri: "https://iam-proxy.nai-system.svc.cluster.local/api/iam/v4.1.b1/authn/oidc/keys"
+      #     backendRefs:
+      #       - group: ""
+      #         kind: Service
+      #         name: iam-proxy
+      #         namespace: nai-system
+      #         port: 443
+      protectedResourceMetadata:
+        resource: "https://10.122.11.125:31807/enterpriseai/mcp/oauth-test"
+        resourceName: "NAI MCP Connection 1"
+        scopesSupported:
+          - "openid"
+          - "email"
+          - "profile"
+      claimToHeaders:
+        - header: "x-jwt-sub"
+          claim: "sub"
+        - header: "x-jwt-email"
+          claim: "email"
+
+  backendRefs:
+    - group: gateway.envoyproxy.io
+      kind: Backend
+      name: mcp-hf
+      namespace: nai-admin-extensions
+      path: /mcp
+      toolSelector:
+        include:
+          - hf_whoami
