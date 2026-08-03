@@ -302,7 +302,10 @@ func (m *mcpRequestContext) servePOST(w http.ResponseWriter, r *http.Request) {
 
 	switch msg := rawMsg.(type) {
 	case *jsonrpc.Response:
-		// We do require a Session ID. If it is not present, a 400 Bad Request response should be returned:
+		// Modern path doesn't have responses (no server-to-client requests).
+		// If we get here with a modern request, something is wrong.
+		//
+		// For legacy path, we do require a Session ID. If it is not present, a 400 Bad Request response should be returned:
 		// https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#session-management
 		if s == nil {
 			errType = metrics.MCPErrorInvalidSessionID
@@ -317,6 +320,12 @@ func (m *mcpRequestContext) servePOST(w http.ResponseWriter, r *http.Request) {
 			result, err = m.handleClientToServerResponse(ctx, s, w, msg)
 		}
 	case *jsonrpc.Request:
+		// P1.1: Era dispatch — detect if this is a modern stateless request.
+		if detectClientEra(r, msg) == eraModern {
+			m.servePOSTStateless(w, r, msg)
+			return
+		}
+
 		requestMethod = msg.Method
 		if m.l.Enabled(ctx, slog.LevelDebug) {
 			m.l.Debug("Decoded MCP request",

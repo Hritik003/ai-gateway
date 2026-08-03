@@ -66,6 +66,7 @@ func NewMCPProxy(l *slog.Logger, mcpMetrics metrics.MCPMetrics, tracer tracingap
 		client:                     http.Client{}, // No timeout as it's enforced at Envoy level.
 		logRequestHeaderAttributes: maps.Clone(logRequestHeaderAttributes),
 		maxRequestBodySize:         getMaxRequestBodySize(),
+		capCache:                   newCapabilityCache(l),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(
@@ -83,10 +84,20 @@ func NewMCPProxy(l *slog.Logger, mcpMetrics metrics.MCPMetrics, tracer tracingap
 			}
 			switch r.Method {
 			case http.MethodGet:
+				// Modern path: GET is not supported (no SSE resumability). Return 405.
+				if r.Header.Get(mcpMethodHeader) != "" && r.Header.Get(sessionIDHeader) == "" {
+					http.Error(w, "GET not supported on modern stateless path", http.StatusMethodNotAllowed)
+					return
+				}
 				proxy.serveGET(w, r)
 			case http.MethodPost:
 				proxy.servePOST(w, r)
 			case http.MethodDelete:
+				// Modern path: DELETE is not supported (no sessions). Return 405.
+				if r.Header.Get(mcpMethodHeader) != "" && r.Header.Get(sessionIDHeader) == "" {
+					http.Error(w, "DELETE not supported on modern stateless path", http.StatusMethodNotAllowed)
+					return
+				}
 				proxy.serverDELETE(w, r)
 			default:
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
