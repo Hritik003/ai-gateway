@@ -164,7 +164,14 @@ func (c *capabilityCache) discoverBackend(ctx context.Context, client *http.Clie
 func mergeDiscoverResults(results []*mcp.DiscoverResult) *mcp.DiscoverResult {
 	merged := &mcp.DiscoverResult{
 		SupportedVersions: supportedVersions,
-		Capabilities:      &mcp.ServerCapabilities{},
+		Capabilities: &mcp.ServerCapabilities{
+			// The gateway implements these modern list/call surfaces even when backends
+			// do not advertise capabilities in server/discover.
+			Tools:       &mcp.ToolCapabilities{},
+			Resources:   &mcp.ResourceCapabilities{},
+			Prompts:     &mcp.PromptCapabilities{},
+			Completions: &mcp.CompletionCapabilities{},
+		},
 	}
 
 	for _, r := range results {
@@ -173,19 +180,20 @@ func mergeDiscoverResults(results []*mcp.DiscoverResult) *mcp.DiscoverResult {
 		}
 		// Union of capabilities: if any backend has it, the gateway has it.
 		if r.Capabilities.Tools != nil {
-			merged.Capabilities.Tools = r.Capabilities.Tools
+			merged.Capabilities.Tools.ListChanged = merged.Capabilities.Tools.ListChanged || r.Capabilities.Tools.ListChanged
 		}
 		if r.Capabilities.Resources != nil {
-			merged.Capabilities.Resources = r.Capabilities.Resources
+			merged.Capabilities.Resources.ListChanged = merged.Capabilities.Resources.ListChanged || r.Capabilities.Resources.ListChanged
+			merged.Capabilities.Resources.Subscribe = merged.Capabilities.Resources.Subscribe || r.Capabilities.Resources.Subscribe
 		}
 		if r.Capabilities.Prompts != nil {
-			merged.Capabilities.Prompts = r.Capabilities.Prompts
+			merged.Capabilities.Prompts.ListChanged = merged.Capabilities.Prompts.ListChanged || r.Capabilities.Prompts.ListChanged
 		}
 		if r.Capabilities.Logging != nil {
-			merged.Capabilities.Logging = r.Capabilities.Logging
+			merged.Capabilities.Logging = &mcp.LoggingCapabilities{}
 		}
 		if r.Capabilities.Completions != nil {
-			merged.Capabilities.Completions = r.Capabilities.Completions
+			merged.Capabilities.Completions = &mcp.CompletionCapabilities{}
 		}
 	}
 	return merged
