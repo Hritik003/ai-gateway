@@ -161,40 +161,18 @@ func (c *capabilityCache) discoverBackend(ctx context.Context, client *http.Clie
 
 // mergeDiscoverResults merges multiple DiscoverResult from route backends into
 // a single DiscoverResult representing the gateway's aggregated capabilities.
+//
+// Capabilities are aggregated using the same union/OR semantics as the stateful
+// initialize path (see unionServerCapabilities): a capability is advertised only
+// when at least one backend advertises it, rather than being hardcoded. This
+// returns whatever the backends actually report.
 func mergeDiscoverResults(results []*mcp.DiscoverResult) *mcp.DiscoverResult {
-	merged := &mcp.DiscoverResult{
-		SupportedVersions: supportedVersions,
-		Capabilities: &mcp.ServerCapabilities{
-			// The gateway implements these modern list/call surfaces even when backends
-			// do not advertise capabilities in server/discover.
-			Tools:       &mcp.ToolCapabilities{},
-			Resources:   &mcp.ResourceCapabilities{},
-			Prompts:     &mcp.PromptCapabilities{},
-			Completions: &mcp.CompletionCapabilities{},
-		},
-	}
-
+	caps := make([]*mcp.ServerCapabilities, 0, len(results))
 	for _, r := range results {
-		if r.Capabilities == nil {
-			continue
-		}
-		// Union of capabilities: if any backend has it, the gateway has it.
-		if r.Capabilities.Tools != nil {
-			merged.Capabilities.Tools.ListChanged = merged.Capabilities.Tools.ListChanged || r.Capabilities.Tools.ListChanged
-		}
-		if r.Capabilities.Resources != nil {
-			merged.Capabilities.Resources.ListChanged = merged.Capabilities.Resources.ListChanged || r.Capabilities.Resources.ListChanged
-			merged.Capabilities.Resources.Subscribe = merged.Capabilities.Resources.Subscribe || r.Capabilities.Resources.Subscribe
-		}
-		if r.Capabilities.Prompts != nil {
-			merged.Capabilities.Prompts.ListChanged = merged.Capabilities.Prompts.ListChanged || r.Capabilities.Prompts.ListChanged
-		}
-		if r.Capabilities.Logging != nil {
-			merged.Capabilities.Logging = &mcp.LoggingCapabilities{}
-		}
-		if r.Capabilities.Completions != nil {
-			merged.Capabilities.Completions = &mcp.CompletionCapabilities{}
-		}
+		caps = append(caps, r.Capabilities)
 	}
-	return merged
+	return &mcp.DiscoverResult{
+		SupportedVersions: supportedVersions,
+		Capabilities:      unionServerCapabilities(caps),
+	}
 }
