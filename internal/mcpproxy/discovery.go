@@ -17,6 +17,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/envoyproxy/ai-gateway/internal/filterapi"
+	"github.com/envoyproxy/ai-gateway/internal/internalapi"
 	"github.com/envoyproxy/ai-gateway/internal/json"
 )
 
@@ -118,6 +119,10 @@ func (c *capabilityCache) discoverBackend(ctx context.Context, client *http.Clie
 	httpReq.Header.Set("Accept", "application/json, text/event-stream")
 	httpReq.Header.Set(mcpProtocolVersionHeader, protocolVersion20260728)
 	httpReq.Header.Set(mcpMethodHeader, "server/discover")
+	// Route and backend headers are required by the gateway backend listener to
+	// dispatch the request to the correct MCP backend.
+	httpReq.Header.Set(internalapi.MCPRouteHeader, string(route))
+	httpReq.Header.Set(internalapi.MCPBackendHeader, string(backend.Name))
 
 	resp, err := client.Do(httpReq)
 	if err != nil {

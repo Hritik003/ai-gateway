@@ -128,6 +128,40 @@ func (m *mcpRequestContext) handleServerDiscover(ctx context.Context, w http.Res
 	writeJSONRPCResult(w, req.ID, merged)
 }
 
+// sendToAllModernBackendsAndAggregateResponses fans out a modern (stateless) list request to all backends in
+// the route and collects each backend's result unmarshaled into T. Backends that
+// fail the request or whose result cannot be unmarshaled are logged and skipped,
+// mirroring the "partial failure is non-fatal" behavior of the legacy aggregation
+// path (sendToAllBackendsAndAggregateResponses).
+//
+// The returned []broadCastResponse[T] is intentionally shaped like the legacy
+// aggregation input so the modern handlers can reuse the same merge* functions
+// (mergeToolsList, mergeResourceList, ...) and avoid drifting from the legacy
+// prefixing/filtering/authorization logic.
+func sendToAllModernBackendsAndAggregateResponses[T any](ctx context.Context, m *mcpRequestContext, req *jsonrpc.Request, route filterapi.MCPRouteName, routeConfig *mcpProxyConfigRoute) []broadCastResponse[T] {
+	responses := make([]broadCastResponse[T], 0, len(routeConfig.backends))
+	for backendName, backend := range routeConfig.backends {
+		resp, err := m.sendModernRequest(ctx, req, route, backend)
+		if err != nil {
+			m.l.Warn("modern list request failed for backend",
+				slog.String("method", req.Method),
+				slog.String("backend", string(backendName)),
+				slog.String("error", err.Error()))
+			continue
+		}
+		var result T
+		if err := json.Unmarshal(resp, &result); err != nil {
+			m.l.Warn("failed to unmarshal modern list response from backend",
+				slog.String("method", req.Method),
+				slog.String("backend", string(backendName)),
+				slog.String("error", err.Error()))
+			continue
+		}
+		responses = append(responses, broadCastResponse[T]{backendName: string(backendName), res: result})
+	}
+	return responses
+}
+
 // handleModernToolsList handles tools/list on the modern stateless path (P1.7).
 func (m *mcpRequestContext) handleModernToolsList(ctx context.Context, w http.ResponseWriter, r *http.Request, req *jsonrpc.Request, route filterapi.MCPRouteName) {
 	routeConfig, ok := m.routes[route]
@@ -136,53 +170,20 @@ func (m *mcpRequestContext) handleModernToolsList(ctx context.Context, w http.Re
 		return
 	}
 
-	// Fan out to all backends.
-	allTools := make([]*mcp.Tool, 0)
-	for backendName, backend := range routeConfig.backends {
-		resp, err := m.sendModernRequest(ctx, req, route, backend)
-		if err != nil {
-			m.l.Warn("tools/list failed for backend",
-				slog.String("backend", string(backendName)),
-				slog.String("error", err.Error()))
-			continue
-		}
-		var listResult mcp.ListToolsResult
-		if err := json.Unmarshal(resp, &listResult); err != nil {
-			m.l.Warn("failed to unmarshal tools/list from backend",
-				slog.String("backend", string(backendName)),
-				slog.String("error", err.Error()))
-			continue
-		}
-		selector := routeConfig.toolSelectors[backendName]
-		for _, t := range listResult.Tools {
-			// Enforce per-route tool selector filters.
-			if selector != nil && !selector.allows(t.Name) {
-				continue
-			}
-			// Enforce per-route authorization so callers only see invokable tools.
-			if routeConfig.authorization != nil {
-				allowed, _ := m.authorizeRequest(routeConfig.authorization, &authorizationRequest{
-					Headers:   r.Header,
-					MCPMethod: "tools/call",
-					Backend:   string(backendName),
-					Tool:      t.Name,
-				})
-				if !allowed {
-					continue
-				}
-			}
-			// Prefix tool names with backend name for namespace isolation.
-			t.Name = downstreamResourceName(t.Name, string(backendName))
-			allTools = append(allTools, t)
-		}
-	}
+	// mergeToolsList reads per-caller headers from m.requestHeaders for authorization.
+	// In production this is set at construction (== r.Header); ensure it is populated
+	// even when this handler is invoked directly (e.g. in tests) so auth stays enforced.
+	m.requestHeaders = r.Header
 
-	result := &mcp.ListToolsResult{Tools: allTools}
+	responses := sendToAllModernBackendsAndAggregateResponses[mcp.ListToolsResult](ctx, m, req, route, routeConfig)
+	// Reuse the shared merge logic so tool-selector filtering, per-caller
+	// authorization, and backend name prefixing stay identical to the legacy path.
+	result := m.mergeToolsList(&session{route: route}, responses)
 	// Caching spec: tools/list results MUST carry caching hints. The set is
 	// filtered per-caller authorization, so it is scoped private.
 	result.TTLMs = defaultListTTLMs
 	result.CacheScope = cacheScopePrivate
-	writeJSONRPCResult(w, req.ID, result)
+	writeJSONRPCResult(w, req.ID, &result)
 }
 
 // handleModernToolsCall handles tools/call on the modern stateless path (P1.5).
@@ -214,6 +215,40 @@ func (m *mcpRequestContext) handleModernToolsCall(ctx context.Context, w http.Re
 		return
 	}
 
+	// Enforce per-route tool selector filters.
+	if selector := routeConfig.toolSelectors[filterapi.MCPBackendName(backendName)]; selector != nil && !selector.allows(upstreamName) {
+		writeJSONRPCError(w, http.StatusBadRequest, &req.ID, -32602, fmt.Sprintf("invalid tool name: %s", upstreamName))
+		return
+	}
+
+	// Enforce per-route authorization (same semantics as legacy path).
+	if routeConfig.authorization != nil {
+		httpPath := ""
+		if r.URL != nil {
+			httpPath = r.URL.Path
+		}
+		allowed, requiredScopes := m.authorizeRequest(routeConfig.authorization, &authorizationRequest{
+			Headers:    r.Header,
+			HTTPMethod: r.Method,
+			Host:       r.Host,
+			HTTPPath:   httpPath,
+			MCPMethod:  req.Method,
+			Backend:    backendName,
+			Tool:       upstreamName,
+			Params:     &params,
+		})
+		if !allowed {
+			// Include a scope challenge when available.
+			if len(requiredScopes) > 0 {
+				if challenge := buildInsufficientScopeHeader(requiredScopes, routeConfig.authorization.ResourceMetadataURL); challenge != "" {
+					w.Header().Set("WWW-Authenticate", challenge)
+				}
+			}
+			writeJSONRPCError(w, http.StatusForbidden, &req.ID, -32603, "access denied")
+			return
+		}
+	}
+
 	// Rewrite the params with the unprefixed name.
 	params.Name = upstreamName
 	rewrittenParams, err := json.Marshal(params)
@@ -235,34 +270,20 @@ func (m *mcpRequestContext) handleModernToolsCall(ctx context.Context, w http.Re
 }
 
 // handleModernResourcesList handles resources/list (P1.7 fan-out).
-func (m *mcpRequestContext) handleModernResourcesList(ctx context.Context, w http.ResponseWriter, r *http.Request, req *jsonrpc.Request, route filterapi.MCPRouteName) {
+func (m *mcpRequestContext) handleModernResourcesList(ctx context.Context, w http.ResponseWriter, _ *http.Request, req *jsonrpc.Request, route filterapi.MCPRouteName) {
 	routeConfig, ok := m.routes[route]
 	if !ok {
 		writeJSONRPCError(w, http.StatusNotFound, &req.ID, -32602, "route not found")
 		return
 	}
 
-	var allResources []*mcp.Resource
-	for backendName, backend := range routeConfig.backends {
-		resp, err := m.sendModernRequest(ctx, req, route, backend)
-		if err != nil {
-			m.l.Warn("resources/list failed for backend", slog.String("backend", string(backendName)), slog.String("error", err.Error()))
-			continue
-		}
-		var listResult mcp.ListResourcesResult
-		if err := json.Unmarshal(resp, &listResult); err != nil {
-			continue
-		}
-		for _, r := range listResult.Resources {
-			r.URI = downstreamResourceURI(r.URI, string(backendName))
-		}
-		allResources = append(allResources, listResult.Resources...)
-	}
-	result := &mcp.ListResourcesResult{Resources: allResources}
+	responses := sendToAllModernBackendsAndAggregateResponses[mcp.ListResourcesResult](ctx, m, req, route, routeConfig)
+	// Reuse the shared merge logic so name/URI prefixing stays identical to the legacy path.
+	result := m.mergeResourceList(&session{route: route}, responses)
 	// Caching spec: resources/list results MUST carry caching hints.
 	result.TTLMs = defaultListTTLMs
 	result.CacheScope = cacheScopePublic
-	writeJSONRPCResult(w, req.ID, result)
+	writeJSONRPCResult(w, req.ID, &result)
 }
 
 // handleModernResourceTemplatesList handles resources/templates/list (P1.7 fan-out).
@@ -275,27 +296,13 @@ func (m *mcpRequestContext) handleModernResourceTemplatesList(ctx context.Contex
 		return
 	}
 
-	var allTemplates []*mcp.ResourceTemplate
-	for backendName, backend := range routeConfig.backends {
-		resp, err := m.sendModernRequest(ctx, req, route, backend)
-		if err != nil {
-			m.l.Warn("resources/templates/list failed for backend", slog.String("backend", string(backendName)), slog.String("error", err.Error()))
-			continue
-		}
-		var listResult mcp.ListResourceTemplatesResult
-		if err := json.Unmarshal(resp, &listResult); err != nil {
-			continue
-		}
-		for _, t := range listResult.ResourceTemplates {
-			t.URITemplate = downstreamResourceURI(t.URITemplate, string(backendName))
-		}
-		allTemplates = append(allTemplates, listResult.ResourceTemplates...)
-	}
-	result := &mcp.ListResourceTemplatesResult{ResourceTemplates: allTemplates}
+	responses := sendToAllModernBackendsAndAggregateResponses[mcp.ListResourceTemplatesResult](ctx, m, req, route, routeConfig)
+	// Reuse the shared merge logic so name/URI-template prefixing stays identical to the legacy path.
+	result := m.mergeResourcesTemplateList(&session{route: route}, responses)
 	// Caching spec: resources/templates/list results MUST carry caching hints.
 	result.TTLMs = defaultListTTLMs
 	result.CacheScope = cacheScopePublic
-	writeJSONRPCResult(w, req.ID, result)
+	writeJSONRPCResult(w, req.ID, &result)
 }
 
 // handleModernResourcesRead handles resources/read (P1.5 single-target).
@@ -410,34 +417,20 @@ func rewriteResourcesReadResult(result json.RawMessage, backendName string) (jso
 }
 
 // handleModernPromptsList handles prompts/list (P1.7 fan-out).
-func (m *mcpRequestContext) handleModernPromptsList(ctx context.Context, w http.ResponseWriter, r *http.Request, req *jsonrpc.Request, route filterapi.MCPRouteName) {
+func (m *mcpRequestContext) handleModernPromptsList(ctx context.Context, w http.ResponseWriter, _ *http.Request, req *jsonrpc.Request, route filterapi.MCPRouteName) {
 	routeConfig, ok := m.routes[route]
 	if !ok {
 		writeJSONRPCError(w, http.StatusNotFound, &req.ID, -32602, "route not found")
 		return
 	}
 
-	var allPrompts []*mcp.Prompt
-	for backendName, backend := range routeConfig.backends {
-		resp, err := m.sendModernRequest(ctx, req, route, backend)
-		if err != nil {
-			m.l.Warn("prompts/list failed for backend", slog.String("backend", string(backendName)), slog.String("error", err.Error()))
-			continue
-		}
-		var listResult mcp.ListPromptsResult
-		if err := json.Unmarshal(resp, &listResult); err != nil {
-			continue
-		}
-		for _, p := range listResult.Prompts {
-			p.Name = downstreamResourceName(p.Name, string(backendName))
-		}
-		allPrompts = append(allPrompts, listResult.Prompts...)
-	}
-	result := &mcp.ListPromptsResult{Prompts: allPrompts}
+	responses := sendToAllModernBackendsAndAggregateResponses[mcp.ListPromptsResult](ctx, m, req, route, routeConfig)
+	// Reuse the shared merge logic so name prefixing stays identical to the legacy path.
+	result := m.mergePromptsList(&session{route: route}, responses)
 	// Caching spec: prompts/list results MUST carry caching hints.
 	result.TTLMs = defaultListTTLMs
 	result.CacheScope = cacheScopePublic
-	writeJSONRPCResult(w, req.ID, result)
+	writeJSONRPCResult(w, req.ID, &result)
 }
 
 // handleModernPromptsGet handles prompts/get (P1.5 single-target).
@@ -673,6 +666,12 @@ func (m *mcpRequestContext) sendModernRequest(ctx context.Context, req *jsonrpc.
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
+	// Keep modern forwarding behavior aligned with the legacy proxy path:
+	// backend/route metadata headers, optional log/header mappings, and original path.
+	addMCPHeaders(httpReq, req, modernParamsForHeaderMetadata(req), route, backend.Name)
+	m.applyLogHeaderMappings(httpReq, req)
+	m.applyOriginalPathHeaders(httpReq)
+
 	// P1.6: Set modern headers. No Mcp-Session-Id, no Last-Event-Id.
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream, application/json")
@@ -680,6 +679,24 @@ func (m *mcpRequestContext) sendModernRequest(ctx context.Context, req *jsonrpc.
 	httpReq.Header.Set(mcpMethodHeader, req.Method)
 	httpReq.Header.Set(internalapi.MCPBackendHeader, string(backend.Name))
 	httpReq.Header.Set(internalapi.MCPRouteHeader, string(route))
+
+	// Forward configured headers to backend.
+	if routeConfig := m.routes[route]; routeConfig != nil {
+		// Route-level headers (e.g. auth claimToHeaders).
+		for _, header := range routeConfig.forwardHeaders {
+			if value := m.requestHeaders.Get(header); value != "" {
+				httpReq.Header.Set(header, value)
+			}
+		}
+		// Per-backend headers (from MCPRouteBackendRef.forwardHeaders) with optional renaming.
+		if b, ok := routeConfig.backends[backend.Name]; ok {
+			for _, fh := range b.ForwardHeaders {
+				if value := m.requestHeaders.Get(fh.Name); value != "" {
+					httpReq.Header.Set(fh.ForwardName(), value)
+				}
+			}
+		}
+	}
 
 	// Set Mcp-Name if applicable.
 	if name := extractNameForMethod(req.Method, json.RawMessage(req.Params)); name != "" {
@@ -778,6 +795,37 @@ func extractNameForMethod(method string, params json.RawMessage) string {
 		}
 	}
 	return ""
+}
+
+// modernParamsForHeaderMetadata best-effort parses params for methods where
+// addMCPHeaders can enrich upstream metadata (tool name/resource URI).
+func modernParamsForHeaderMetadata(req *jsonrpc.Request) mcp.Params {
+	if req == nil || req.Params == nil {
+		return nil
+	}
+	switch req.Method {
+	case "tools/call":
+		var p mcp.CallToolParams
+		if json.Unmarshal(req.Params, &p) == nil {
+			return &p
+		}
+	case "resources/read":
+		var p mcp.ReadResourceParams
+		if json.Unmarshal(req.Params, &p) == nil {
+			return &p
+		}
+	case "resources/subscribe":
+		var p mcp.SubscribeParams
+		if json.Unmarshal(req.Params, &p) == nil {
+			return &p
+		}
+	case "resources/unsubscribe":
+		var p mcp.UnsubscribeParams
+		if json.Unmarshal(req.Params, &p) == nil {
+			return &p
+		}
+	}
+	return nil
 }
 
 // --- JSON-RPC response helpers ---
