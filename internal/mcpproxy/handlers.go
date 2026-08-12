@@ -322,7 +322,7 @@ func (m *mcpRequestContext) servePOST(w http.ResponseWriter, r *http.Request) {
 		}
 	case *jsonrpc.Request:
 		// P1.1: Era dispatch — detect if this is a modern stateless request.
-		if detectClientEra(r, msg) == eraModern {
+		if detectClientEra(r, msg).era == eraModern {
 			m.servePOSTStateless(w, r, msg)
 			return
 		}
