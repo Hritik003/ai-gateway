@@ -101,6 +101,7 @@ func (m *mcpRequestContext) discoverBackend(ctx context.Context, route filterapi
 	req := &jsonrpc.Request{
 		ID:     id,
 		Method: "server/discover",
+		Params: discoverParams(),
 	}
 
 	resultRaw, err := m.sendModernRequest(ctx, req, route, backend)
@@ -115,6 +116,15 @@ func (m *mcpRequestContext) discoverBackend(ctx context.Context, route filterapi
 
 	m.capCache.set(route, backend.Name, &result)
 	return &result, nil
+}
+
+
+func discoverParams() []byte {
+	return []byte(`{"_meta":{` +
+		`"` + metaProtocolVersion + `":"` + protocolVersion20260728 + `",` +
+		`"` + metaClientInfo + `":{"name":"envoy-ai-gateway","version":"1.0.0"},` +
+		`"` + metaClientCapabilities + `":{}` +
+		`}}`)
 }
 
 // mergeDiscoverResults merges multiple DiscoverResult from route backends into
