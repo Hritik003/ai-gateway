@@ -117,6 +117,11 @@ func (m *mcpRequestContext) handleServerDiscover(ctx context.Context, w http.Res
 		}
 		results = append(results, result)
 	}
+	if len(results) == 0 {
+		m.l.Error("server/discover failed for all backends", slog.String("route", string(route)))
+		writeJSONRPCError(w, http.StatusInternalServerError, &req.ID, -32603, "failed to discover any backend")
+		return
+	}
 
 	merged := mergeDiscoverResults(results)
 	merged.Instructions = fmt.Sprintf("Envoy AI Gateway — MCP proxy aggregating %d backends", len(routeConfig.backends))

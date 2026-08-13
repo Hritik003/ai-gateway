@@ -149,6 +149,96 @@ func TestHandleModernToolsList_AppliesAuthorization(t *testing.T) {
 	})
 }
 
+func TestHandleServerDiscover_PartialFailureStillSucceeds(t *testing.T) {
+	proxy := newTestMCPProxy()
+	proxy.capCache = newCapabilityCache(proxy.l)
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backend := r.Header.Get(internalapi.MCPBackendHeader)
+		if backend == "backend2" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = stdjson.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      "1",
+				"error": map[string]any{
+					"code":    -32601,
+					"message": "Method not found: server/discover",
+				},
+			})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = stdjson.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      "1",
+			"result": map[string]any{
+				"supportedVersions": []string{protocolVersion20260728},
+				"capabilities":      map[string]any{"tools": map[string]any{"listChanged": true}},
+			},
+		})
+	}))
+	defer backendServer.Close()
+
+	proxy.backendListenerAddr = backendServer.URL
+	proxy.client = *backendServer.Client()
+
+	id, err := jsonrpc.MakeID("1")
+	require.NoError(t, err)
+	req := &jsonrpc.Request{
+		ID:     id,
+		Method: "server/discover",
+		Params: discoverParams(),
+	}
+
+	rr := httptest.NewRecorder()
+	proxy.handleServerDiscover(context.Background(), rr, req, "test-route")
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	var rpcResp struct {
+		Error  any                `json:"error"`
+		Result mcp.DiscoverResult `json:"result"`
+	}
+	require.NoError(t, stdjson.Unmarshal(rr.Body.Bytes(), &rpcResp))
+	require.Nil(t, rpcResp.Error)
+	require.NotNil(t, rpcResp.Result.Capabilities)
+	require.NotNil(t, rpcResp.Result.Capabilities.Tools)
+}
+
+func TestHandleServerDiscover_AllBackendsFailReturnsError(t *testing.T) {
+	proxy := newTestMCPProxy()
+	proxy.capCache = newCapabilityCache(proxy.l)
+	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = stdjson.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      "1",
+			"error": map[string]any{
+				"code":    -32601,
+				"message": "Method not found: server/discover",
+			},
+		})
+	}))
+	defer backendServer.Close()
+
+	proxy.backendListenerAddr = backendServer.URL
+	proxy.client = *backendServer.Client()
+
+	id, err := jsonrpc.MakeID("1")
+	require.NoError(t, err)
+	req := &jsonrpc.Request{
+		ID:     id,
+		Method: "server/discover",
+		Params: discoverParams(),
+	}
+
+	rr := httptest.NewRecorder()
+	proxy.handleServerDiscover(context.Background(), rr, req, "test-route")
+
+	require.Equal(t, http.StatusInternalServerError, rr.Code)
+	require.Contains(t, rr.Body.String(), "failed to discover any backend")
+}
+
 func modernToolsFromResponse(t *testing.T, body []byte) []*mcp.Tool {
 	t.Helper()
 	var rpcResp struct {
