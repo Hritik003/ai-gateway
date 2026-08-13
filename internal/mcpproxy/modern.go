@@ -705,12 +705,13 @@ func (m *mcpRequestContext) sendModernRequest(ctx context.Context, req *jsonrpc.
 		return nil, fmt.Errorf("invalid tools/call params: missing required name")
 	}
 
+	m.l.Warn("modern outbound request to backend", slog.String("backend", string(backend.Name)), slog.String("method", req.Method), slog.String("params", string(req.Params)), slog.String("body", string(body)))
 	resp, err := m.client.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
-
+	m.l.Warn("modern outbound response received", "backend=", backend.Name, "method=", req.Method, "status=", resp.StatusCode, "contentType=", resp.Header.Get("Content-Type"))
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("backend returned status %d: %s", resp.StatusCode, string(respBody))
