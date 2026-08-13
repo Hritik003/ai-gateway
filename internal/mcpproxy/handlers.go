@@ -79,7 +79,27 @@ func (m *mcpRequestContext) servePOST(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if detectClientEra(r, rawMsg).era == eraModern {
+	detection := detectClientEra(r, rawMsg)
+	if detection.err != nil {
+		var id *jsonrpc.ID
+		switch msg := rawMsg.(type) {
+		case *jsonrpc.Request:
+			id = &msg.ID
+		case *jsonrpc.Response:
+			id = &msg.ID
+		}
+		writeJSONRPCErrorWithData(
+			w,
+			detection.err.HTTPStatus,
+			id,
+			detection.err.Code,
+			detection.err.Message,
+			detection.err.Data,
+		)
+		return
+	}
+
+	if detection.era == eraModern {
 		req, ok := rawMsg.(*jsonrpc.Request)
 		if !ok || req == nil {
 			onErrorResponse(w, http.StatusBadRequest, "invalid JSON-RPC message: expected request")

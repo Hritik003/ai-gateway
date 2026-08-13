@@ -4,12 +4,9 @@
 package mcpproxy
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
 	"sync"
 	"time"
 
@@ -17,7 +14,6 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/envoyproxy/ai-gateway/internal/filterapi"
-	"github.com/envoyproxy/ai-gateway/internal/internalapi"
 	"github.com/envoyproxy/ai-gateway/internal/json"
 )
 
@@ -76,13 +72,6 @@ func (c *capabilityCache) set(route filterapi.MCPRouteName, backend filterapi.MC
 	c.entries[key] = entry
 }
 
-// invalidate removes a cached entry for the given route+backend.
-func (c *capabilityCache) invalidate(route filterapi.MCPRouteName, backend filterapi.MCPBackendName) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.entries, discoverCacheKey{route: route, backend: backend})
-}
-
 // invalidateRoute removes all cached entries for a route (e.g., on list_changed notification).
 func (c *capabilityCache) invalidateRoute(route filterapi.MCPRouteName) {
 	c.mu.Lock()
@@ -96,8 +85,15 @@ func (c *capabilityCache) invalidateRoute(route filterapi.MCPRouteName) {
 
 // discoverBackend sends a server/discover request to a single backend and caches the result.
 // If the result is already cached and fresh, returns it immediately.
-func (c *capabilityCache) discoverBackend(ctx context.Context, client *http.Client, backendAddr string, route filterapi.MCPRouteName, backend filterapi.MCPBackend) (*mcp.DiscoverResult, error) {
-	if cached := c.get(route, backend.Name); cached != nil {
+//
+// It reuses sendModernRequest so the fan-out carries the exact same headers as
+// every other modern request (original-path, forwarded/auth headers, log header
+// mappings). Building the request independently previously dropped those headers,
+// which caused the gateway backend listener to reject server/discover with a 400
+// while resources/list, prompts/list, and tools/call kept working — collapsing the
+// aggregated capabilities to whatever survived an empty union.
+func (m *mcpRequestContext) discoverBackend(ctx context.Context, route filterapi.MCPRouteName, backend filterapi.MCPBackend) (*mcp.DiscoverResult, error) {
+	if cached := m.capCache.get(route, backend.Name); cached != nil {
 		return cached, nil
 	}
 
@@ -106,53 +102,10 @@ func (c *capabilityCache) discoverBackend(ctx context.Context, client *http.Clie
 		ID:     id,
 		Method: "server/discover",
 	}
-	body, err := jsonrpc.EncodeMessage(req)
-	if err != nil {
-		return nil, fmt.Errorf("encode server/discover: %w", err)
-	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, backendAddr, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "application/json, text/event-stream")
-	httpReq.Header.Set(mcpProtocolVersionHeader, protocolVersion20260728)
-	httpReq.Header.Set(mcpMethodHeader, "server/discover")
-	// Route and backend headers are required by the gateway backend listener to
-	// dispatch the request to the correct MCP backend.
-	httpReq.Header.Set(internalapi.MCPRouteHeader, string(route))
-	httpReq.Header.Set(internalapi.MCPBackendHeader, string(backend.Name))
-
-	resp, err := client.Do(httpReq)
+	resultRaw, err := m.sendModernRequest(ctx, req, route, backend)
 	if err != nil {
 		return nil, fmt.Errorf("server/discover request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		c.l.Warn("server/discover non-200; backend may be legacy",
-			slog.String("backend", string(backend.Name)),
-			slog.Int("status", resp.StatusCode))
-		return nil, fmt.Errorf("server/discover returned status %d", resp.StatusCode)
-	}
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	// Parse the JSON-RPC response envelope. Use map to avoid jsonrpc.ID issues with sonic.
-	var rpcResp map[string]json.RawMessage
-	if err := json.Unmarshal(respBody, &rpcResp); err != nil {
-		return nil, fmt.Errorf("parse server/discover response: %w", err)
-	}
-	if errField, ok := rpcResp["error"]; ok && string(errField) != "null" {
-		return nil, fmt.Errorf("server/discover error: %s", string(errField))
-	}
-	resultRaw, ok := rpcResp["result"]
-	if !ok || string(resultRaw) == "null" {
-		return nil, fmt.Errorf("server/discover returned nil result")
 	}
 
 	var result mcp.DiscoverResult
@@ -160,7 +113,7 @@ func (c *capabilityCache) discoverBackend(ctx context.Context, client *http.Clie
 		return nil, fmt.Errorf("unmarshal DiscoverResult: %w", err)
 	}
 
-	c.set(route, backend.Name, &result)
+	m.capCache.set(route, backend.Name, &result)
 	return &result, nil
 }
 

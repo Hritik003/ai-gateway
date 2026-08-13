@@ -108,7 +108,7 @@ func (m *mcpRequestContext) handleServerDiscover(ctx context.Context, w http.Res
 
 	var results []*mcp.DiscoverResult
 	for _, backend := range routeConfig.backends {
-		result, err := m.capCache.discoverBackend(ctx, &m.client, m.backendListenerAddr, route, backend)
+		result, err := m.discoverBackend(ctx, route, backend)
 		if err != nil {
 			m.l.Warn("server/discover failed for backend",
 				slog.String("backend", string(backend.Name)),
