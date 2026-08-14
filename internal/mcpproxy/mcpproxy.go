@@ -68,7 +68,6 @@ func NewMCPProxy(l *slog.Logger, mcpMetrics metrics.MCPMetrics, tracer tracingap
 		client:                     http.Client{}, // No timeout as it's enforced at Envoy level.
 		logRequestHeaderAttributes: maps.Clone(logRequestHeaderAttributes),
 		maxRequestBodySize:         getMaxRequestBodySize(),
-		capCache:                   newCapabilityCache(l),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(

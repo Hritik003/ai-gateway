@@ -105,7 +105,7 @@ func (m *mcpRequestContext) servePOST(w http.ResponseWriter, r *http.Request) {
 			onErrorResponse(w, http.StatusBadRequest, "invalid JSON-RPC message: expected request")
 			return
 		}
-		m.servePOSTStateless(w, r, req)
+		m.serveModernPOST(w, r, req, startAt)
 		return
 	}
 

@@ -32,7 +32,6 @@ type (
 		client                     http.Client
 		logRequestHeaderAttributes map[string]string
 		maxRequestBodySize         int64 // maximum allowed POST body size in bytes
-		capCache                   *capabilityCache // modern protocol capability cache
 	}
 
 	mcpProxyConfig struct {
