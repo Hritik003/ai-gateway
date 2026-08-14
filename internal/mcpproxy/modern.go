@@ -156,7 +156,10 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 	// Start a tracing span for the request, mirroring the legacy path. The span
 	// is closed in the deferred block below. Fan-out handlers additionally record
 	// per-backend routing on the span via RecordRouteToBackend.
-	span := m.tracer.StartSpanAndInjectMeta(ctx, req, modernParamsForHeaderMetadata(req), r.Header)
+	var span tracingapi.MCPSpan
+	if params := modernParamsForHeaderMetadata(req); params != nil {
+		span = m.tracer.StartSpanAndInjectMeta(ctx, req, params, r.Header)
+	}
 	defer func() {
 		if span == nil {
 			return
