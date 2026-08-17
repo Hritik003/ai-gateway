@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -301,7 +300,7 @@ func TestHandleModernToolsList_AggregatesAndPrefixes(t *testing.T) {
 	names := make([]string, 0, len(tools.Tools))
 	for _, tl := range tools.Tools {
 		names = append(names, tl.Name)
-		require.True(t, strings.Contains(tl.Name, nameSeparator))
+		require.Contains(t, tl.Name, nameSeparator)
 	}
 	require.Contains(t, names, downstreamResourceName("search", "backend1"))
 	require.Contains(t, names, downstreamResourceName("search", "backend2"))

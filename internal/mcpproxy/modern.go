@@ -187,13 +187,13 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 	case "tools/call":
 		result, err = m.handleModernToolsCall(ctx, w, r, req, route, span)
 	case "resources/read":
-		result, err = m.handleModernResourcesRead(ctx, w, r, req, route, span)
+		result, err = m.handleModernResourcesRead(ctx, w, req, route, span)
 	case "prompts/get":
-		result, err = m.handleModernPromptsGet(ctx, w, r, req, route, span)
+		result, err = m.handleModernPromptsGet(ctx, w, req, route, span)
 	case "subscriptions/listen":
-		result, err = m.handleSubscriptionsListen(ctx, w, r, req, route)
+		result, err = m.handleSubscriptionsListen(ctx, w, req, route)
 	case "completion/complete":
-		result, err = m.handleModernComplete(ctx, w, r, req, route, span)
+		result, err = m.handleModernComplete(ctx, w, req, route, span)
 	default:
 		errType = metrics.MCPErrorUnsupportedMethod
 		err = fmt.Errorf("unknown method: %s", req.Method)
@@ -250,6 +250,42 @@ func (m *mcpRequestContext) handleServerDiscover(ctx context.Context, w http.Res
 	merged.CacheScope = defaultCacheScope
 	writeJSONRPCResult(w, req.ID, merged)
 	return handlerResult{}, nil
+}
+
+// discoverBackend sends a server/discover request to a single backend.
+//
+// TODO: this used to consult a per-instance capabilityCache to avoid a
+// server/discover round-trip to every backend on every aggregated request. The
+// cache was removed until we have a multiplexing-aware caching strategy (see the
+// TODO on defaultTTLMs/defaultCacheScope in era.go), so every discover currently
+// hits the backend live.
+func (m *mcpRequestContext) discoverBackend(ctx context.Context, route filterapi.MCPRouteName, backend filterapi.MCPBackend) (*mcp.DiscoverResult, error) {
+	id, _ := jsonrpc.MakeID(fmt.Sprintf("gw-discover-%s-%d", backend.Name, time.Now().UnixNano()))
+	req := &jsonrpc.Request{
+		ID:     id,
+		Method: "server/discover",
+		Params: discoverParams(),
+	}
+
+	resultRaw, err := m.sendModernRequest(ctx, req, route, backend)
+	if err != nil {
+		return nil, fmt.Errorf("server/discover request failed: %w", err)
+	}
+
+	var result mcp.DiscoverResult
+	if err := json.Unmarshal(resultRaw, &result); err != nil {
+		return nil, fmt.Errorf("unmarshal DiscoverResult: %w", err)
+	}
+
+	return &result, nil
+}
+
+func discoverParams() []byte {
+	return []byte(`{"_meta":{` +
+		`"` + metaProtocolVersion + `":"` + protocolVersion20260728 + `",` +
+		`"` + metaClientInfo + `":{"name":"envoy-ai-gateway","version":"1.0.0"},` +
+		`"` + metaClientCapabilities + `":{}` +
+		`}}`)
 }
 
 // mergeDiscoverResults merges multiple DiscoverResult from route backends into
@@ -445,7 +481,7 @@ func (m *mcpRequestContext) handleModernToolsCall(ctx context.Context, w http.Re
 }
 
 // handleModernResourcesRead handles resources/read (P1.5 single-target).
-func (m *mcpRequestContext) handleModernResourcesRead(ctx context.Context, w http.ResponseWriter, r *http.Request, req *jsonrpc.Request, route filterapi.MCPRouteName, span tracingapi.MCPSpan) (handlerResult, error) {
+func (m *mcpRequestContext) handleModernResourcesRead(ctx context.Context, w http.ResponseWriter, req *jsonrpc.Request, route filterapi.MCPRouteName, span tracingapi.MCPSpan) (handlerResult, error) {
 	routeConfig, ok := m.routes[route]
 	if !ok {
 		onErrorResponse(w, http.StatusNotFound, "route not found")
@@ -562,7 +598,7 @@ func rewriteResourcesReadResult(result json.RawMessage, backendName string) (jso
 }
 
 // handleModernPromptsGet handles prompts/get (P1.5 single-target).
-func (m *mcpRequestContext) handleModernPromptsGet(ctx context.Context, w http.ResponseWriter, r *http.Request, req *jsonrpc.Request, route filterapi.MCPRouteName, span tracingapi.MCPSpan) (handlerResult, error) {
+func (m *mcpRequestContext) handleModernPromptsGet(ctx context.Context, w http.ResponseWriter, req *jsonrpc.Request, route filterapi.MCPRouteName, span tracingapi.MCPSpan) (handlerResult, error) {
 	routeConfig, ok := m.routes[route]
 	if !ok {
 		onErrorResponse(w, http.StatusNotFound, "route not found")
@@ -610,7 +646,7 @@ func (m *mcpRequestContext) handleModernPromptsGet(ctx context.Context, w http.R
 }
 
 // handleModernComplete handles completion/complete (P1.5 single-target).
-func (m *mcpRequestContext) handleModernComplete(ctx context.Context, w http.ResponseWriter, _ *http.Request, req *jsonrpc.Request, route filterapi.MCPRouteName, span tracingapi.MCPSpan) (handlerResult, error) {
+func (m *mcpRequestContext) handleModernComplete(ctx context.Context, w http.ResponseWriter, req *jsonrpc.Request, route filterapi.MCPRouteName, span tracingapi.MCPSpan) (handlerResult, error) {
 	// completion/complete targets a specific resource by ref; for the POC just proxy to first backend.
 	routeConfig, ok := m.routes[route]
 	if !ok {
@@ -639,7 +675,7 @@ func (m *mcpRequestContext) handleModernComplete(ctx context.Context, w http.Res
 // does not fit the request-duration metric shape. It sets
 // perBackendMetricsRecorded to skip the generic recording in serveModernPOST,
 // mirroring how the legacy path treats streaming/notification methods.
-func (m *mcpRequestContext) handleSubscriptionsListen(ctx context.Context, w http.ResponseWriter, r *http.Request, req *jsonrpc.Request, route filterapi.MCPRouteName) (handlerResult, error) {
+func (m *mcpRequestContext) handleSubscriptionsListen(ctx context.Context, w http.ResponseWriter, req *jsonrpc.Request, route filterapi.MCPRouteName) (handlerResult, error) {
 	m.perBackendMetricsRecorded = true
 
 	routeConfig, ok := m.routes[route]
@@ -1060,49 +1096,4 @@ func isSupportedVersion(v string) bool {
 		}
 	}
 	return false
-}
-
-// --- server/discover ---
-
-// discoverBackend sends a server/discover request to a single backend.
-//
-// TODO: this used to consult a per-instance capabilityCache to avoid a
-// server/discover round-trip to every backend on every aggregated request. The
-// cache was removed until we have a multiplexing-aware caching strategy (see the
-// TODO on defaultTTLMs/defaultCacheScope in era.go), so every discover currently
-// hits the backend live.
-//
-// It reuses sendModernRequest so the fan-out carries the exact same headers as
-// every other modern request (original-path, forwarded/auth headers, log header
-// mappings). Building the request independently previously dropped those headers,
-// which caused the gateway backend listener to reject server/discover with a 400
-// while resources/list, prompts/list, and tools/call kept working — collapsing the
-// aggregated capabilities to whatever survived an empty union.
-func (m *mcpRequestContext) discoverBackend(ctx context.Context, route filterapi.MCPRouteName, backend filterapi.MCPBackend) (*mcp.DiscoverResult, error) {
-	id, _ := jsonrpc.MakeID(fmt.Sprintf("gw-discover-%s-%d", backend.Name, time.Now().UnixNano()))
-	req := &jsonrpc.Request{
-		ID:     id,
-		Method: "server/discover",
-		Params: discoverParams(),
-	}
-
-	resultRaw, err := m.sendModernRequest(ctx, req, route, backend)
-	if err != nil {
-		return nil, fmt.Errorf("server/discover request failed: %w", err)
-	}
-
-	var result mcp.DiscoverResult
-	if err := json.Unmarshal(resultRaw, &result); err != nil {
-		return nil, fmt.Errorf("unmarshal DiscoverResult: %w", err)
-	}
-
-	return &result, nil
-}
-
-func discoverParams() []byte {
-	return []byte(`{"_meta":{` +
-		`"` + metaProtocolVersion + `":"` + protocolVersion20260728 + `",` +
-		`"` + metaClientInfo + `":{"name":"envoy-ai-gateway","version":"1.0.0"},` +
-		`"` + metaClientCapabilities + `":{}` +
-		`}}`)
 }
