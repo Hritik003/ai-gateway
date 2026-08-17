@@ -1,6 +1,12 @@
 // Copyright Envoy AI Gateway Authors
 // SPDX-License-Identifier: Apache-2.0
+// The full text of the Apache license is available in the LICENSE file at
+// the root of the repo.
 
+// Copyright Envoy AI Gateway Authors
+// SPDX-License-Identifier: Apache-2.0
+//
+//nolint:unused // TODO: remove this once full era dispatch wiring is enabled.
 package mcpproxy
 
 import (
@@ -34,12 +40,7 @@ import (
 // TODO: come up with a proper multiplexing-aware caching strategy. When the
 // gateway aggregates results from N backends, each backend can advertise its
 // own ttlMs/cacheScope and there is no single correct way to fold them into one
-// aggregated hint. For now we mirror agentgateway's conservative behavior and
-// disable caching entirely: ttlMs=0 (immediately stale) and cacheScope=private
-// (never shared across authorization contexts). This is always safe but forgoes
-// any caching benefit; a smarter fold (min TTL, most-restrictive scope, and
-// reusing backend discovery freshness) should replace it later.
-// See https://github.com/agentgateway/agentgateway/blob/82cbbf6f5bd988899302c8bce2a8d006355355ef/crates/agentgateway/src/mcp/handler.rs#L748
+// aggregated hint. For now, we mark TTL as 0 and cacheScope as private.
 const (
 	// defaultTTLMs marks aggregated results as immediately stale so clients
 	// re-fetch every time. Safe default until a multiplexing-aware TTL exists.
@@ -105,7 +106,7 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 		metricsInstance.RecordMethodCount(ctx, req.Method, nil)
 	}()
 
-	route := filterapi.MCPRouteName(r.Header.Get(internalapi.MCPRouteHeader))
+	route := r.Header.Get(internalapi.MCPRouteHeader)
 	if route == "" {
 		m.l.Error("missing route header on modern request")
 		errType = metrics.MCPErrorInternal
@@ -225,7 +226,7 @@ func (m *mcpRequestContext) handleServerDiscover(ctx context.Context, w http.Res
 		backendMetrics := m.metrics.WithBackend(backend.Name)
 		if err != nil {
 			m.l.Warn("server/discover failed for backend",
-				slog.String("backend", string(backend.Name)),
+				slog.String("backend", backend.Name),
 				slog.String("error", err.Error()))
 			backendMetrics.RecordMethodErrorCount(ctx, req.Method, nil, metrics.MCPStatusError)
 			backendMetrics.RecordRequestErrorDuration(ctx, backendStartAt, errorType(err), nil)
@@ -239,7 +240,7 @@ func (m *mcpRequestContext) handleServerDiscover(ctx context.Context, w http.Res
 		results = append(results, result)
 	}
 	if len(results) == 0 {
-		m.l.Error("server/discover failed for all backends", slog.String("route", string(route)))
+		m.l.Error("server/discover failed for all backends", slog.String("route", route))
 		onErrorResponse(w, http.StatusInternalServerError, "failed to discover any backend")
 		return handlerResult{}, errors.New("failed to discover any backend")
 	}
@@ -810,12 +811,12 @@ func sendToAllModernBackendsAndAggregateResponses[T any](ctx context.Context, m 
 	responses := make([]broadCastResponse[T], 0, len(routeConfig.backends))
 	for backendName, backend := range routeConfig.backends {
 		backendStartAt := time.Now()
-		backendMetrics := m.metrics.WithBackend(string(backendName))
+		backendMetrics := m.metrics.WithBackend(backendName)
 		resp, err := m.sendModernRequest(ctx, req, route, backend)
 		if err != nil {
 			m.l.Warn("modern list request failed for backend",
 				slog.String("method", req.Method),
-				slog.String("backend", string(backendName)),
+				slog.String("backend", backendName),
 				slog.String("error", err.Error()))
 			backendMetrics.RecordMethodErrorCount(ctx, req.Method, nil, metrics.MCPStatusError)
 			backendMetrics.RecordRequestErrorDuration(ctx, backendStartAt, errorType(err), nil)
@@ -825,7 +826,7 @@ func sendToAllModernBackendsAndAggregateResponses[T any](ctx context.Context, m 
 		if err := json.Unmarshal(resp, &result); err != nil {
 			m.l.Warn("failed to unmarshal modern list response from backend",
 				slog.String("method", req.Method),
-				slog.String("backend", string(backendName)),
+				slog.String("backend", backendName),
 				slog.String("error", err.Error()))
 			backendMetrics.RecordMethodErrorCount(ctx, req.Method, nil, metrics.MCPStatusError)
 			backendMetrics.RecordRequestErrorDuration(ctx, backendStartAt, metrics.MCPErrorInternal, nil)
@@ -833,7 +834,7 @@ func sendToAllModernBackendsAndAggregateResponses[T any](ctx context.Context, m 
 		}
 		backendMetrics.RecordMethodCount(ctx, req.Method, nil)
 		backendMetrics.RecordRequestDuration(ctx, backendStartAt, nil)
-		responses = append(responses, broadCastResponse[T]{backendName: string(backendName), res: result})
+		responses = append(responses, broadCastResponse[T]{backendName: backendName, res: result})
 	}
 	return responses
 }
@@ -862,8 +863,8 @@ func (m *mcpRequestContext) sendModernRequest(ctx context.Context, req *jsonrpc.
 	httpReq.Header.Set("Accept", "text/event-stream, application/json")
 	httpReq.Header.Set(mcpProtocolVersionHeader, protocolVersion20260728)
 	httpReq.Header.Set(mcpMethodHeader, req.Method)
-	httpReq.Header.Set(internalapi.MCPBackendHeader, string(backend.Name))
-	httpReq.Header.Set(internalapi.MCPRouteHeader, string(route))
+	httpReq.Header.Set(internalapi.MCPBackendHeader, backend.Name)
+	httpReq.Header.Set(internalapi.MCPRouteHeader, route)
 
 	// Forward configured headers to backend.
 	if routeConfig := m.routes[route]; routeConfig != nil {
@@ -890,7 +891,7 @@ func (m *mcpRequestContext) sendModernRequest(ctx context.Context, req *jsonrpc.
 		return nil, fmt.Errorf("invalid tools/call params: missing required name")
 	}
 
-	m.l.Warn("modern outbound request to backend", slog.String("backend", string(backend.Name)), slog.String("method", req.Method), slog.String("params", string(req.Params)), slog.String("body", string(body)))
+	m.l.Warn("modern outbound request to backend", slog.String("backend", backend.Name), slog.String("method", req.Method), slog.String("params", string(req.Params)), slog.String("body", string(body)))
 	resp, err := m.client.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
@@ -1014,34 +1015,6 @@ func modernParamsForHeaderMetadata(req *jsonrpc.Request) mcp.Params {
 	return nil
 }
 
-// --- JSON-RPC response helpers ---
-
-func writeJSONRPCError(w http.ResponseWriter, httpStatus int, id *jsonrpc.ID, code int, message string) {
-	writeJSONRPCErrorWithData(w, httpStatus, id, code, message, nil)
-}
-
-func writeJSONRPCErrorWithData(w http.ResponseWriter, httpStatus int, id *jsonrpc.ID, code int, message string, data any) {
-	resp := map[string]any{
-		"jsonrpc": "2.0",
-		"error": map[string]any{
-			"code":    code,
-			"message": message,
-		},
-	}
-	if id != nil {
-		resp["id"] = id.Raw()
-	} else {
-		resp["id"] = nil
-	}
-	if data != nil {
-		resp["error"].(map[string]any)["data"] = data
-	}
-	encoded, _ := json.Marshal(resp)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(httpStatus)
-	_, _ = w.Write(encoded)
-}
-
 func writeJSONRPCResult(w http.ResponseWriter, id jsonrpc.ID, result any) {
 	encoded, _ := json.Marshal(result)
 	writeRawJSONRPCResult(w, id, encoded)
@@ -1054,7 +1027,7 @@ func writeRawJSONRPCResult(w http.ResponseWriter, id jsonrpc.ID, result json.Raw
 	resp := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      id.Raw(),
-		"result":  json.RawMessage(result),
+		"result":  result,
 	}
 	encoded, _ := json.Marshal(resp)
 	w.Header().Set("Content-Type", "application/json")
