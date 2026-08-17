@@ -81,21 +81,7 @@ func (m *mcpRequestContext) servePOST(w http.ResponseWriter, r *http.Request) {
 
 	detection := detectClientEra(r, rawMsg)
 	if detection.err != nil {
-		var id *jsonrpc.ID
-		switch msg := rawMsg.(type) {
-		case *jsonrpc.Request:
-			id = &msg.ID
-		case *jsonrpc.Response:
-			id = &msg.ID
-		}
-		writeJSONRPCErrorWithData(
-			w,
-			detection.err.HTTPStatus,
-			id,
-			detection.err.Code,
-			detection.err.Message,
-			detection.err.Data,
-		)
+		onErrorResponse(w, detection.err.HTTPStatus, detection.err.Message)
 		return
 	}
 
