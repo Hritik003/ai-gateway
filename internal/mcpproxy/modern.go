@@ -110,7 +110,7 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 		m.l.Error("missing route header on modern request")
 		errType = metrics.MCPErrorInternal
 		err = errors.New("missing route header")
-		writeJSONRPCError(w, http.StatusInternalServerError, nil, -32603, "missing route header")
+		onErrorResponse(w, http.StatusInternalServerError, "missing route header")
 		return
 	}
 
@@ -118,7 +118,7 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 	if headerMethod != req.Method {
 		errType = metrics.MCPErrorInvalidJSONRPC
 		err = fmt.Errorf("Mcp-Method header mismatch")
-		writeJSONRPCError(w, http.StatusBadRequest, &req.ID, errCodeHeaderMismatch,
+		onErrorResponse(w, http.StatusBadRequest,
 			fmt.Sprintf("Mcp-Method header '%s' does not match body method '%s'", headerMethod, req.Method))
 		return
 	}
@@ -130,8 +130,7 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 	if !isSupportedVersion(headerVersion) {
 		errType = metrics.MCPErrorUnsupportedProtocolVersion
 		err = fmt.Errorf("unsupported protocol version: %s", headerVersion)
-		writeJSONRPCErrorWithData(w, http.StatusBadRequest, &req.ID, errCodeUnsupportedProtocolVersion,
-			"unsupported protocol version", map[string]any{"supported": supportedVersions})
+		onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("unsupported protocol version: %s", headerVersion))
 		return
 	}
 
@@ -139,17 +138,17 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 	case "initialize", "notifications/initialized":
 		errType = metrics.MCPErrorUnsupportedMethod
 		err = fmt.Errorf("method removed in 2026-07-28: %s", req.Method)
-		writeJSONRPCError(w, http.StatusBadRequest, &req.ID, errCodeMethodNotFound, "method removed in 2026-07-28: use server/discover")
+		onErrorResponse(w, http.StatusNotFound, "method removed in 2026-07-28: use server/discover")
 		return
 	case "ping":
 		errType = metrics.MCPErrorUnsupportedMethod
 		err = errors.New("ping removed in 2026-07-28")
-		writeJSONRPCError(w, http.StatusBadRequest, &req.ID, errCodeMethodNotFound, "ping removed in 2026-07-28")
+		onErrorResponse(w, http.StatusNotFound, "ping removed in 2026-07-28")
 		return
 	case "logging/setLevel":
 		errType = metrics.MCPErrorUnsupportedMethod
 		err = errors.New("logging/setLevel removed in 2026-07-28")
-		writeJSONRPCError(w, http.StatusBadRequest, &req.ID, errCodeMethodNotFound, "logging/setLevel removed in 2026-07-28; use _meta logLevel")
+		onErrorResponse(w, http.StatusNotFound, "logging/setLevel removed in 2026-07-28; use _meta logLevel")
 		return
 	}
 
@@ -197,8 +196,7 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 	default:
 		errType = metrics.MCPErrorUnsupportedMethod
 		err = fmt.Errorf("unknown method: %s", req.Method)
-		writeJSONRPCError(w, http.StatusBadRequest, &req.ID, errCodeMethodNotFound,
-			fmt.Sprintf("unknown method: %s", req.Method))
+		onErrorResponse(w, http.StatusNotFound, fmt.Sprintf("unknown method: %s", req.Method))
 		return
 	}
 	if errType == "" {
@@ -216,7 +214,7 @@ func (m *mcpRequestContext) handleServerDiscover(ctx context.Context, w http.Res
 
 	routeConfig, ok := m.routes[route]
 	if !ok {
-		writeJSONRPCError(w, http.StatusNotFound, &req.ID, -32602, "route not found")
+		onErrorResponse(w, http.StatusNotFound, "route not found")
 		return handlerResult{}, fmt.Errorf("%w: %s", errBackendNotFound, route)
 	}
 
@@ -242,7 +240,7 @@ func (m *mcpRequestContext) handleServerDiscover(ctx context.Context, w http.Res
 	}
 	if len(results) == 0 {
 		m.l.Error("server/discover failed for all backends", slog.String("route", string(route)))
-		writeJSONRPCError(w, http.StatusInternalServerError, &req.ID, -32603, "failed to discover any backend")
+		onErrorResponse(w, http.StatusInternalServerError, "failed to discover any backend")
 		return handlerResult{}, errors.New("failed to discover any backend")
 	}
 	merged := mergeDiscoverResults(results)
@@ -278,7 +276,7 @@ func (m *mcpRequestContext) handleModernToolsList(ctx context.Context, w http.Re
 
 	routeConfig, ok := m.routes[route]
 	if !ok {
-		writeJSONRPCError(w, http.StatusNotFound, &req.ID, -32602, "route not found")
+		onErrorResponse(w, http.StatusNotFound, "route not found")
 		return handlerResult{}, fmt.Errorf("%w: %s", errBackendNotFound, route)
 	}
 
@@ -304,7 +302,7 @@ func (m *mcpRequestContext) handleModernResourcesList(ctx context.Context, w htt
 
 	routeConfig, ok := m.routes[route]
 	if !ok {
-		writeJSONRPCError(w, http.StatusNotFound, &req.ID, -32602, "route not found")
+		onErrorResponse(w, http.StatusNotFound, "route not found")
 		return handlerResult{}, fmt.Errorf("%w: %s", errBackendNotFound, route)
 	}
 
@@ -324,7 +322,7 @@ func (m *mcpRequestContext) handleModernResourceTemplatesList(ctx context.Contex
 
 	routeConfig, ok := m.routes[route]
 	if !ok {
-		writeJSONRPCError(w, http.StatusNotFound, &req.ID, -32602, "route not found")
+		onErrorResponse(w, http.StatusNotFound, "route not found")
 		return handlerResult{}, fmt.Errorf("%w: %s", errBackendNotFound, route)
 	}
 	responses := sendToAllModernBackendsAndAggregateResponses[mcp.ListResourceTemplatesResult](ctx, m, req, route, routeConfig)
@@ -344,7 +342,7 @@ func (m *mcpRequestContext) handleModernPromptsList(ctx context.Context, w http.
 
 	routeConfig, ok := m.routes[route]
 	if !ok {
-		writeJSONRPCError(w, http.StatusNotFound, &req.ID, -32602, "route not found")
+		onErrorResponse(w, http.StatusNotFound, "route not found")
 		return handlerResult{}, fmt.Errorf("%w: %s", errBackendNotFound, route)
 	}
 
@@ -361,34 +359,34 @@ func (m *mcpRequestContext) handleModernPromptsList(ctx context.Context, w http.
 func (m *mcpRequestContext) handleModernToolsCall(ctx context.Context, w http.ResponseWriter, r *http.Request, req *jsonrpc.Request, route filterapi.MCPRouteName, span tracingapi.MCPSpan) (handlerResult, error) {
 	routeConfig, ok := m.routes[route]
 	if !ok {
-		writeJSONRPCError(w, http.StatusNotFound, &req.ID, -32602, "route not found")
+		onErrorResponse(w, http.StatusNotFound, "route not found")
 		return handlerResult{}, fmt.Errorf("%w: %s", errBackendNotFound, route)
 	}
 
 	// Extract tool name from params.
 	var params mcp.CallToolParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
-		writeJSONRPCError(w, http.StatusBadRequest, &req.ID, -32602, "invalid tools/call params")
+		onErrorResponse(w, http.StatusBadRequest, "invalid tools/call params")
 		return handlerResult{}, fmt.Errorf("invalid tools/call params: %w", &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: err.Error()})
 	}
 
 	// Decode backend from prefixed tool name.
 	backendName, upstreamName, err := upstreamResourceName(params.Name)
 	if err != nil {
-		writeJSONRPCError(w, http.StatusBadRequest, &req.ID, -32602, fmt.Sprintf("invalid tool name: %v", err))
+		onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid tool name: %v", err))
 		return handlerResult{}, fmt.Errorf("%w: %s", errInvalidToolName, params.Name)
 	}
 	result := handlerResult{backendName: backendName}
 
 	backend, ok := routeConfig.backends[filterapi.MCPBackendName(backendName)]
 	if !ok {
-		writeJSONRPCError(w, http.StatusNotFound, &req.ID, errCodeResourceNotFound, fmt.Sprintf("backend not found: %s", backendName))
+		onErrorResponse(w, http.StatusNotFound, fmt.Sprintf("unknown backend %s", backendName))
 		return result, fmt.Errorf("%w: %s", errBackendNotFound, backendName)
 	}
 
 	// Enforce per-route tool selector filters.
 	if selector := routeConfig.toolSelectors[filterapi.MCPBackendName(backendName)]; selector != nil && !selector.allows(upstreamName) {
-		writeJSONRPCError(w, http.StatusBadRequest, &req.ID, -32602, fmt.Sprintf("invalid tool name: %s", upstreamName))
+		onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid tool name: %s", upstreamName))
 		return result, fmt.Errorf("%w: %s", errInvalidToolName, upstreamName)
 	}
 
@@ -415,7 +413,7 @@ func (m *mcpRequestContext) handleModernToolsCall(ctx context.Context, w http.Re
 					w.Header().Set("WWW-Authenticate", challenge)
 				}
 			}
-			writeJSONRPCError(w, http.StatusForbidden, &req.ID, -32603, "access denied")
+			onErrorResponse(w, http.StatusForbidden, "access denied")
 			return result, errors.New("authorization failed")
 		}
 	}
@@ -424,7 +422,7 @@ func (m *mcpRequestContext) handleModernToolsCall(ctx context.Context, w http.Re
 	params.Name = upstreamName
 	rewrittenParams, err := json.Marshal(params)
 	if err != nil {
-		writeJSONRPCError(w, http.StatusBadRequest, &req.ID, -32602, fmt.Sprintf("invalid tools/call params: %v", err))
+		onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid tools/call params: %v", err))
 		return result, fmt.Errorf("invalid tools/call params: %w", err)
 	}
 	req.Params = rewrittenParams
@@ -436,7 +434,7 @@ func (m *mcpRequestContext) handleModernToolsCall(ctx context.Context, w http.Re
 	// Send to backend and proxy the response (P1.9: MRTR passthrough).
 	resp, err := m.sendModernRequest(ctx, req, route, backend)
 	if err != nil {
-		writeJSONRPCError(w, http.StatusBadGateway, &req.ID, -32603, fmt.Sprintf("backend error: %v", err))
+		onErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("call to %s failed: %v", backend.Name, err))
 		return result, err
 	}
 
@@ -449,33 +447,33 @@ func (m *mcpRequestContext) handleModernToolsCall(ctx context.Context, w http.Re
 func (m *mcpRequestContext) handleModernResourcesRead(ctx context.Context, w http.ResponseWriter, r *http.Request, req *jsonrpc.Request, route filterapi.MCPRouteName, span tracingapi.MCPSpan) (handlerResult, error) {
 	routeConfig, ok := m.routes[route]
 	if !ok {
-		writeJSONRPCError(w, http.StatusNotFound, &req.ID, -32602, "route not found")
+		onErrorResponse(w, http.StatusNotFound, "route not found")
 		return handlerResult{}, fmt.Errorf("%w: %s", errBackendNotFound, route)
 	}
 
 	var params mcp.ReadResourceParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
-		writeJSONRPCError(w, http.StatusBadRequest, &req.ID, -32602, "invalid resources/read params")
+		onErrorResponse(w, http.StatusBadRequest, "invalid resources/read params")
 		return handlerResult{}, fmt.Errorf("invalid resources/read params: %w", &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: err.Error()})
 	}
 
 	backendName, upstreamURI, err := upstreamResourceURI(params.URI)
 	if err != nil {
-		writeJSONRPCError(w, http.StatusBadRequest, &req.ID, -32602, fmt.Sprintf("invalid resource URI: %v", err))
+		onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid resource URI: %v", err))
 		return handlerResult{}, fmt.Errorf("%w: %s", errInvalidToolName, params.URI)
 	}
 	result := handlerResult{backendName: backendName}
 
 	backend, ok := routeConfig.backends[filterapi.MCPBackendName(backendName)]
 	if !ok {
-		writeJSONRPCError(w, http.StatusNotFound, &req.ID, errCodeResourceNotFound, fmt.Sprintf("backend not found: %s", backendName))
+		onErrorResponse(w, http.StatusNotFound, fmt.Sprintf("unknown backend %s", backendName))
 		return result, fmt.Errorf("%w: %s", errBackendNotFound, backendName)
 	}
 
 	params.URI = upstreamURI
 	rewrittenParams, err := json.Marshal(params)
 	if err != nil {
-		writeJSONRPCError(w, http.StatusBadRequest, &req.ID, -32602, fmt.Sprintf("invalid resources/read params: %v", err))
+		onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid resources/read params: %v", err))
 		return result, fmt.Errorf("invalid resources/read params: %w", err)
 	}
 	req.Params = rewrittenParams
@@ -486,7 +484,7 @@ func (m *mcpRequestContext) handleModernResourcesRead(ctx context.Context, w htt
 
 	resp, err := m.sendModernRequest(ctx, req, route, backend)
 	if err != nil {
-		writeJSONRPCError(w, http.StatusBadGateway, &req.ID, -32603, fmt.Sprintf("backend error: %v", err))
+		onErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("call to %s failed: %v", backend.Name, err))
 		return result, err
 	}
 
@@ -566,33 +564,33 @@ func rewriteResourcesReadResult(result json.RawMessage, backendName string) (jso
 func (m *mcpRequestContext) handleModernPromptsGet(ctx context.Context, w http.ResponseWriter, r *http.Request, req *jsonrpc.Request, route filterapi.MCPRouteName, span tracingapi.MCPSpan) (handlerResult, error) {
 	routeConfig, ok := m.routes[route]
 	if !ok {
-		writeJSONRPCError(w, http.StatusNotFound, &req.ID, -32602, "route not found")
+		onErrorResponse(w, http.StatusNotFound, "route not found")
 		return handlerResult{}, fmt.Errorf("%w: %s", errBackendNotFound, route)
 	}
 
 	var params mcp.GetPromptParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
-		writeJSONRPCError(w, http.StatusBadRequest, &req.ID, -32602, "invalid prompts/get params")
+		onErrorResponse(w, http.StatusBadRequest, "invalid prompts/get params")
 		return handlerResult{}, fmt.Errorf("invalid prompts/get params: %w", &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: err.Error()})
 	}
 
 	backendName, upstreamName, err := upstreamResourceName(params.Name)
 	if err != nil {
-		writeJSONRPCError(w, http.StatusBadRequest, &req.ID, -32602, fmt.Sprintf("invalid prompt name: %v", err))
+		onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid prompt name: %v", err))
 		return handlerResult{}, fmt.Errorf("%w: %s", errInvalidToolName, params.Name)
 	}
 	result := handlerResult{backendName: backendName}
 
 	backend, ok := routeConfig.backends[filterapi.MCPBackendName(backendName)]
 	if !ok {
-		writeJSONRPCError(w, http.StatusNotFound, &req.ID, errCodeResourceNotFound, fmt.Sprintf("backend not found: %s", backendName))
+		onErrorResponse(w, http.StatusNotFound, fmt.Sprintf("unknown backend %s", backendName))
 		return result, fmt.Errorf("%w: %s", errBackendNotFound, backendName)
 	}
 
 	params.Name = upstreamName
 	rewrittenParams, err := json.Marshal(params)
 	if err != nil {
-		writeJSONRPCError(w, http.StatusBadRequest, &req.ID, -32602, fmt.Sprintf("invalid prompts/get params: %v", err))
+		onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid prompts/get params: %v", err))
 		return result, fmt.Errorf("invalid prompts/get params: %w", err)
 	}
 	req.Params = rewrittenParams
@@ -603,7 +601,7 @@ func (m *mcpRequestContext) handleModernPromptsGet(ctx context.Context, w http.R
 
 	resp, err := m.sendModernRequest(ctx, req, route, backend)
 	if err != nil {
-		writeJSONRPCError(w, http.StatusBadGateway, &req.ID, -32603, fmt.Sprintf("backend error: %v", err))
+		onErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("call to %s failed: %v", backend.Name, err))
 		return result, err
 	}
 	writeRawJSONRPCResult(w, req.ID, resp)
@@ -615,7 +613,7 @@ func (m *mcpRequestContext) handleModernComplete(ctx context.Context, w http.Res
 	// completion/complete targets a specific resource by ref; for the POC just proxy to first backend.
 	routeConfig, ok := m.routes[route]
 	if !ok {
-		writeJSONRPCError(w, http.StatusNotFound, &req.ID, -32602, "route not found")
+		onErrorResponse(w, http.StatusNotFound, "route not found")
 		return handlerResult{}, fmt.Errorf("%w: %s", errBackendNotFound, route)
 	}
 	for _, backend := range routeConfig.backends {
@@ -629,7 +627,7 @@ func (m *mcpRequestContext) handleModernComplete(ctx context.Context, w http.Res
 		writeRawJSONRPCResult(w, req.ID, resp)
 		return handlerResult{backendName: string(backend.Name)}, nil
 	}
-	writeJSONRPCError(w, http.StatusBadGateway, &req.ID, -32603, "all backends failed")
+	onErrorResponse(w, http.StatusInternalServerError, "all backends failed")
 	return handlerResult{}, errors.New("all backends failed")
 }
 
@@ -645,7 +643,7 @@ func (m *mcpRequestContext) handleSubscriptionsListen(ctx context.Context, w htt
 
 	routeConfig, ok := m.routes[route]
 	if !ok {
-		writeJSONRPCError(w, http.StatusNotFound, &req.ID, -32602, "route not found")
+		onErrorResponse(w, http.StatusNotFound, "route not found")
 		return handlerResult{}, fmt.Errorf("%w: %s", errBackendNotFound, route)
 	}
 
