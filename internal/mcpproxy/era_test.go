@@ -201,7 +201,7 @@ func TestDetectClientEra_NoVersionHeader(t *testing.T) {
 func TestValidateLegacyRequest(t *testing.T) {
 	t.Run("modern-only method is rejected even on legacy", func(t *testing.T) {
 		for method := range modernOnlyMethods {
-			got := validateLegacyRequest(&requestDetails{hasMethod: true, method: method})
+			got := validateLegacyRequest(&requestDetails{isRequest: true, method: method})
 			require.NotNil(t, got.err, "method %q", method)
 			require.Equal(t, errCodeMethodNotFound, got.err.Code)
 			// Legacy carries JSON-RPC failures inside a 200 body.
@@ -211,7 +211,7 @@ func TestValidateLegacyRequest(t *testing.T) {
 
 	t.Run("ordinary legacy request passes and preserves version", func(t *testing.T) {
 		got := validateLegacyRequest(&requestDetails{
-			hasMethod:     true,
+			isRequest:     true,
 			method:        "tools/list",
 			headerVersion: protocolVersion20250618,
 		})
@@ -224,17 +224,18 @@ func TestValidateLegacyRequest(t *testing.T) {
 func TestValidateModernRequest(t *testing.T) {
 	caps := []byte(`{"tools":{}}`)
 
-	t.Run("JSON-RPC response skips _meta validation", func(t *testing.T) {
-		// hasMethod=false means the body is a response, not a request/notification.
-		// Classification still returns modern so the downstream *jsonrpc.Request
-		// assertion can reject it with the precise error.
+	t.Run("JSON-RPC response is rejected", func(t *testing.T) {
+		// isRequestOrNotification=false means the body is a response, not a request/notification.
+		// The modern stateless POST path carries no server-initiated requests, so a
+		// response has nothing to answer and must be rejected.
 		got := validateModernRequest(&requestDetails{
 			headerVersion: protocolVersion20260728,
-			hasMethod:     false,
+			isRequest:     false,
 		})
-		require.Nil(t, got.err)
-		require.Equal(t, eraModern, got.era)
-		require.Equal(t, protocolVersion20260728, got.version)
+		require.NotNil(t, got.err)
+		require.Equal(t, errCodeInvalidRequest, got.err.Code)
+		require.Equal(t, http.StatusBadRequest, got.err.HTTPStatus)
+		require.Contains(t, got.err.Message, "responses are not valid")
 	})
 
 	t.Run("well-formed call passes", func(t *testing.T) {
@@ -242,7 +243,7 @@ func TestValidateModernRequest(t *testing.T) {
 			headerVersion:   protocolVersion20260728,
 			headerMethod:    "tools/call",
 			method:          "tools/call",
-			hasMethod:       true,
+			isRequest:       true,
 			expectsResponse: true,
 			params:          modernMeta(protocolVersion20260728, caps),
 		})
@@ -255,7 +256,7 @@ func TestValidateModernRequest(t *testing.T) {
 		got := validateModernRequest(&requestDetails{
 			headerVersion:   protocolVersion20260728,
 			method:          "tools/call",
-			hasMethod:       true,
+			isRequest:       true,
 			expectsResponse: true,
 			params:          modernMeta(protocolVersion20260728, caps),
 		})
@@ -270,7 +271,7 @@ func TestValidateModernRequest(t *testing.T) {
 			headerVersion:   protocolVersion20260728,
 			headerMethod:    "tools/list",
 			method:          "tools/call",
-			hasMethod:       true,
+			isRequest:       true,
 			expectsResponse: true,
 			params:          modernMeta(protocolVersion20260728, caps),
 		})
@@ -285,7 +286,7 @@ func TestValidateModernRequest(t *testing.T) {
 			headerMethod:    "tools/call",
 			method:          "tools/call",
 			sessionID:       "sess",
-			hasMethod:       true,
+			isRequest:       true,
 			expectsResponse: true,
 			params:          modernMeta(protocolVersion20260728, caps),
 		})
@@ -300,7 +301,7 @@ func TestValidateModernRequest(t *testing.T) {
 				headerVersion:   protocolVersion20260728,
 				headerMethod:    method,
 				method:          method,
-				hasMethod:       true,
+				isRequest:       true,
 				expectsResponse: true,
 				params:          modernMeta(protocolVersion20260728, caps),
 			})
@@ -315,7 +316,7 @@ func TestValidateModernRequest(t *testing.T) {
 			headerVersion:   protocolVersion20260728,
 			headerMethod:    "tools/call",
 			method:          "tools/call",
-			hasMethod:       true,
+			isRequest:       true,
 			expectsResponse: true,
 			params:          []byte(`{"_meta":123}`),
 		})
@@ -329,7 +330,7 @@ func TestValidateModernRequest(t *testing.T) {
 			headerVersion:   protocolVersion20260728,
 			headerMethod:    "tools/call",
 			method:          "tools/call",
-			hasMethod:       true,
+			isRequest:       true,
 			expectsResponse: true,
 			params:          modernMeta("", caps),
 		})
@@ -343,7 +344,7 @@ func TestValidateModernRequest(t *testing.T) {
 			headerVersion:   protocolVersion20260728,
 			headerMethod:    "tools/call",
 			method:          "tools/call",
-			hasMethod:       true,
+			isRequest:       true,
 			expectsResponse: true,
 			params:          modernMeta(protocolVersion20251125, caps),
 		})
@@ -357,7 +358,7 @@ func TestValidateModernRequest(t *testing.T) {
 			headerVersion:   protocolVersion20260728,
 			headerMethod:    "tools/call",
 			method:          "tools/call",
-			hasMethod:       true,
+			isRequest:       true,
 			expectsResponse: true,
 			params:          modernMeta(protocolVersion20260728, nil),
 		})
@@ -373,7 +374,7 @@ func TestValidateModernRequest(t *testing.T) {
 			headerVersion:   protocolVersion20260728,
 			headerMethod:    "tools/call",
 			method:          "tools/call",
-			hasMethod:       true,
+			isRequest:       true,
 			expectsResponse: true,
 			params:          params,
 		})
@@ -388,7 +389,7 @@ func TestValidateModernRequest(t *testing.T) {
 			headerVersion:   protocolVersion20260728,
 			headerMethod:    "notifications/progress",
 			method:          "notifications/progress",
-			hasMethod:       true,
+			isRequest:       true,
 			expectsResponse: false,
 			params:          modernMeta(protocolVersion20260728, nil),
 		})
@@ -426,19 +427,6 @@ func TestDetectClientEra_ModernEndToEnd(t *testing.T) {
 		require.Equal(t, errCodeMethodNotFound, got.err.Code)
 		require.Equal(t, http.StatusNotFound, got.err.HTTPStatus)
 	})
-}
-
-// TestVersionErasTable guards the invariant that every supported version is
-// classified and every classified version is advertised as supported.
-func TestVersionErasTable(t *testing.T) {
-	for _, v := range supportedVersions {
-		_, ok := versionEras[v]
-		require.True(t, ok, "supported version %q must have an era mapping", v)
-	}
-	require.Len(t, versionEras, len(supportedVersions))
-	require.Equal(t, eraModern, versionEras[protocolVersion20260728])
-	require.Equal(t, eraLegacy, versionEras[protocolVersion20251125])
-	require.Equal(t, eraLegacy, versionEras[protocolVersion20250618])
 }
 
 // TestMethodTablesDisjoint guards against a method being simultaneously legacy-

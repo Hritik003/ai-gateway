@@ -49,9 +49,6 @@ const (
 	errCodeMissingRequiredCapability = mcp.CodeMissingRequiredClientCapabilities // -32021
 )
 
-// supportedVersions lists all protocol versions the gateway supports, newest first.
-var supportedVersions = []string{protocolVersion20260728, protocolVersion20251125, protocolVersion20250618}
-
 // versionEras maps known protocol versions to the interaction model they imply.
 // Only 2026-07-28 is modern; every other value — including versions absent from
 // this map — is treated as legacy, matching the original initialize path which
@@ -141,8 +138,9 @@ type requestDetails struct {
 	method string
 	// params is the raw params object from the body.
 	params json.RawMessage
-	// hasMethod is true for JSON-RPC requests/notifications, false for responses.
-	hasMethod bool
+	// isRequest is true when the body is a JSON-RPC request or
+	// notification (both carry a method), and false when it is a response.
+	isRequest bool
 	// expectsResponse is true for requests with a valid id (calls), false for notifications.
 	expectsResponse bool
 }
@@ -174,7 +172,7 @@ func getRequestDetails(r *http.Request, msg jsonrpc.Message) requestDetails {
 	if req, ok := msg.(*jsonrpc.Request); ok && req != nil {
 		reqDetails.method = req.Method
 		reqDetails.params = json.RawMessage(req.Params)
-		reqDetails.hasMethod = true
+		reqDetails.isRequest = true
 		reqDetails.expectsResponse = req.ID.IsValid()
 	}
 	return reqDetails
@@ -213,6 +211,7 @@ func detectClientEra(r *http.Request, msg jsonrpc.Message) eraDetection {
 	if r.Method != http.MethodPost {
 		return eraDetection{era: eraLegacy}
 	}
+
 	// Every POST request to the MCP endpoint MUST include an MCP-Protocol-Version header.
 	// Ref: https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http#protocol-version-header
 	reqDetails := getRequestDetails(r, msg)
@@ -230,7 +229,7 @@ func detectClientEra(r *http.Request, msg jsonrpc.Message) eraDetection {
 // authoritative. Errors ride a 200 response body, which is how legacy
 // Streamable HTTP carries JSON-RPC failures.
 func validateLegacyRequest(requestDetails *requestDetails) eraDetection {
-	if requestDetails.hasMethod {
+	if requestDetails.isRequest {
 		// this rejects modern methods even on legacy requests, so we can return early
 		if _, modernOnly := modernOnlyMethods[requestDetails.method]; modernOnly {
 			return eraDetection{err: &protocolError{
@@ -249,15 +248,15 @@ func validateLegacyRequest(requestDetails *requestDetails) eraDetection {
 // validateModernRequest enforces the invariants a 2026-07-28 request must
 // satisfy before the gateway will treat its mirrored headers as trustworthy.
 func validateModernRequest(requestDetails *requestDetails) eraDetection {
-	if !requestDetails.hasMethod {
-		// A message with no method is a JSON-RPC response. The modern
-		// stateless POST path only carries requests and notifications; a
-		// response here is rejected downstream by the *jsonrpc.Request
-		// assertion. Skip the _meta gates below, which would otherwise
-		// reject it with a misleading InvalidParams error.
-		return eraDetection{era: eraModern, version: requestDetails.headerVersion}
+	// Modern path doesn't have responses (no server-to-client requests).
+	// If we get here with a response body, something is wrong.
+	if !requestDetails.isRequest {
+		return eraDetection{err: &protocolError{
+			Code:       errCodeInvalidRequest,
+			Message:    "JSON-RPC responses are not valid on the modern POST path",
+			HTTPStatus: http.StatusBadRequest,
+		}}
 	}
-
 	// SEP-2243: Mcp-Method is required on every request and notification, and a
 	// mirrored header that disagrees with the body lets an intermediary route
 	// on one operation while the server executes another. Both a missing header
