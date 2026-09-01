@@ -36,7 +36,6 @@ import (
 const (
 	defaultTTLMs      = 0
 	defaultCacheScope = "public"
-
 )
 
 // serveModernPOST handles modern (2026-07-28) stateless POST requests.

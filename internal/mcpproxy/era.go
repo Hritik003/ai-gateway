@@ -209,19 +209,12 @@ func jsonPresent(raw json.RawMessage) bool {
 
 // detectClientEra determines whether an incoming request is from a legacy or
 // modern client, and validates the request against the era it declares.
-//
-// The gateway proxies Streamable HTTP only, so request is required to be non-nil.
-//
-// Resolution order:
-//  1. Anything other than POST is legacy: the GET SSE endpoint and DELETE
-//     session termination were removed by the 2026-07-28 spec, which uses POST
-//     for all communication.
-//  2. A declared Mcp-Protocol-Version is authoritative. 2026-07-28 is modern;
-//     any other value, including an unrecognised one, is legacy.
 func detectClientEra(r *http.Request, msg jsonrpc.Message) eraDetection {
 	if r.Method != http.MethodPost {
 		return eraDetection{era: eraLegacy}
 	}
+	// Every POST request to the MCP endpoint MUST include an MCP-Protocol-Version header.
+	// Ref: https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http#protocol-version-header
 	reqDetails := getRequestDetails(r, msg)
 	if versionEras[reqDetails.headerVersion] == eraModern {
 		return validateModernRequest(&reqDetails)
