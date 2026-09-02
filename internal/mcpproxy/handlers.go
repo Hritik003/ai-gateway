@@ -33,12 +33,6 @@ type handlerResult struct {
 	backendName string
 }
 
-func onErrorResponse(w http.ResponseWriter, status int, msg string) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(status)
-	_, _ = w.Write([]byte(msg))
-}
-
 // postCompletion is the final bookkeeping for a POST, shared by serveLegacyPOST
 // and serveModernPOST. Callers invoke recordPOSTCompletion from a defer so these
 // fields are read after the handler has set them. session is nil on the
@@ -55,11 +49,70 @@ type postCompletion struct {
 	session *session
 }
 
+func onErrorResponse(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte(msg))
+}
+
+// servePOST is the era-neutral entry point for MCP POST requests. It reads and
+// decodes the JSON-RPC message once, then dispatches to the modern stateless
+// path or the legacy path based on the era detected from the request.
+//
+// Keeping this dispatcher thin is deliberate: once the legacy MCP spec is fully
+// retired, the legacy branch and legacy.go can be removed in one step without
+// touching the modern path.
+func (m *mcpRequestContext) servePOST(w http.ResponseWriter, r *http.Request) {
+	startAt := time.Now()
+
+	limit := m.maxRequestBodySize
+	if limit <= 0 {
+		limit = defaultMaxRequestBodySize
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			onErrorResponse(w, http.StatusRequestEntityTooLarge, "request body too large")
+			m.metrics.RecordRequestErrorDuration(r.Context(), startAt, metrics.MCPErrorInternal, nil)
+			return
+		}
+		onErrorResponse(w, http.StatusBadRequest, err.Error())
+		m.metrics.RecordRequestErrorDuration(r.Context(), startAt, metrics.MCPErrorInternal, nil)
+		return
+	}
+
+	rawMsg, err := jsonrpc.DecodeMessage(body)
+	if err != nil {
+		onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid JSON-RPC message: %v", err))
+		m.metrics.RecordRequestErrorDuration(r.Context(), startAt, metrics.MCPErrorInvalidJSONRPC, nil)
+		return
+	}
+
+	detection := detectClientEra(r, rawMsg)
+	if detection.err != nil {
+		onErrorResponse(w, detection.err.HTTPStatus, detection.err.Message)
+		return
+	}
+
+	if detection.era == eraModern {
+		req, ok := rawMsg.(*jsonrpc.Request)
+		if !ok || req == nil {
+			onErrorResponse(w, http.StatusBadRequest, "invalid JSON-RPC message: expected request")
+			return
+		}
+		m.serveModernPOST(w, r, req, startAt)
+		return
+	}
+
+	m.serveLegacyPOST(w, r, rawMsg, startAt)
+}
+
 // recordPOSTCompletion logs completion, records metrics, and closes the tracing
 // span. Handlers that fan out to multiple backends (e.g. tools/list,
 // server/discover) set perBackendMetricsRecorded to skip generic per-backend
 // recording and avoid double-counting. The tracing span is still closed.
-func (m *mcpRequestContext) recordPOSTCompletion(c postCompletion) {
+func (m *mcpRequestContext) recordPOSTCompletion(c *postCompletion) {
 	if m.l.Enabled(c.ctx, slog.LevelDebug) {
 		m.l.Debug("Completed MCP POST request",
 			slog.String("method", c.method),
@@ -117,59 +170,6 @@ func endMCPSpan(span tracingapi.MCPSpan, errType metrics.MCPErrorType, err error
 	} else {
 		span.EndSpan()
 	}
-}
-
-// servePOST is the era-neutral entry point for MCP POST requests. It reads and
-// decodes the JSON-RPC message once, then dispatches to the modern stateless
-// path or the legacy path based on the era detected from the request.
-//
-// Keeping this dispatcher thin is deliberate: once the legacy MCP spec is fully
-// retired, the legacy branch and legacy.go can be removed in one step without
-// touching the modern path.
-func (m *mcpRequestContext) servePOST(w http.ResponseWriter, r *http.Request) {
-	startAt := time.Now()
-
-	limit := m.maxRequestBodySize
-	if limit <= 0 {
-		limit = defaultMaxRequestBodySize
-	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
-	if err != nil {
-		var maxBytesErr *http.MaxBytesError
-		if errors.As(err, &maxBytesErr) {
-			onErrorResponse(w, http.StatusRequestEntityTooLarge, "request body too large")
-			m.metrics.RecordRequestErrorDuration(r.Context(), startAt, metrics.MCPErrorInternal, nil)
-			return
-		}
-		onErrorResponse(w, http.StatusBadRequest, err.Error())
-		m.metrics.RecordRequestErrorDuration(r.Context(), startAt, metrics.MCPErrorInternal, nil)
-		return
-	}
-
-	rawMsg, err := jsonrpc.DecodeMessage(body)
-	if err != nil {
-		onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid JSON-RPC message: %v", err))
-		m.metrics.RecordRequestErrorDuration(r.Context(), startAt, metrics.MCPErrorInvalidJSONRPC, nil)
-		return
-	}
-
-	detection := detectClientEra(r, rawMsg)
-	if detection.err != nil {
-		onErrorResponse(w, detection.err.HTTPStatus, detection.err.Message)
-		return
-	}
-
-	if detection.era == eraModern {
-		req, ok := rawMsg.(*jsonrpc.Request)
-		if !ok || req == nil {
-			onErrorResponse(w, http.StatusBadRequest, "invalid JSON-RPC message: expected request")
-			return
-		}
-		m.serveModernPOST(w, r, req, startAt)
-		return
-	}
-
-	m.serveLegacyPOST(w, r, rawMsg, startAt)
 }
 
 // nameSeparator is used as the separator to avoid collision with any character in k8s resource names as well as base64 encoding.

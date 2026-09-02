@@ -201,7 +201,7 @@ func (m *mcpRequestContext) serveLegacyPOST(w http.ResponseWriter, r *http.Reque
 	// Arguments are captured in the closure so they are read after the handler
 	// returns, not at defer registration.
 	defer func() {
-		m.recordPOSTCompletion(postCompletion{
+		m.recordPOSTCompletion(&postCompletion{
 			ctx:     ctx,
 			method:  requestMethod,
 			errType: errType,
