@@ -34,8 +34,9 @@ import (
 )
 
 const (
-	defaultTTLMs      = 0
-	defaultCacheScope = "public"
+	defaultTTLMs            = 0
+	defaultCacheScope       = "public"
+	protocolVersion20251125 = "25-11-2025"
 )
 
 var supportedVersions = []string{protocolVersion20260728, protocolVersion20251125, protocolVersion20250618}
@@ -51,48 +52,23 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 		ctx     = r.Context()
 		err     error
 		errType metrics.MCPErrorType
+		span    tracingapi.MCPSpan
 		result  handlerResult
 	)
 
-	// Record metrics and close the tracing span once the request completes,
-	// mirroring the deferred bookkeeping on the legacy path (serveLegacyPOST).
-	// Handlers that fan out to multiple backends (e.g. server/discover, *_list)
-	// set perBackendMetricsRecorded to skip the generic per-backend recording
-	// here and avoid double-counting.
+	// Arguments are captured in the closure so they are read after the handler
+	// returns, not at defer registration. session and params are nil: modern
+	// requests are stateless and do not attach MCP params to metrics.
 	defer func() {
-		if m.l.Enabled(ctx, slog.LevelDebug) {
-			m.l.Debug("Completed modern MCP POST request",
-				slog.String("method", req.Method),
-				slog.String("error_type", string(errType)),
-				slog.String("duration", time.Since(startAt).String()))
-		}
-
-		if m.perBackendMetricsRecorded {
-			return
-		}
-
-		metricsInstance := m.metrics
-		if result.backendName != "" {
-			metricsInstance = m.metrics.WithBackend(result.backendName)
-		}
-
-		if err != nil {
-			applicationError := false
-			var errToolCall *errToolCall
-			if errors.As(err, &errToolCall) {
-				applicationError = true
-			}
-			if applicationError {
-				metricsInstance.RecordMethodErrorCount(ctx, req.Method, nil, metrics.MCPStatusFailed)
-			} else {
-				metricsInstance.RecordMethodErrorCount(ctx, req.Method, nil, metrics.MCPStatusError)
-			}
-			metricsInstance.RecordRequestErrorDuration(ctx, startAt, errType, nil)
-			return
-		}
-
-		metricsInstance.RecordRequestDuration(ctx, startAt, nil)
-		metricsInstance.RecordMethodCount(ctx, req.Method, nil)
+		m.recordPOSTCompletion(postCompletion{
+			ctx:     ctx,
+			method:  req.Method,
+			errType: errType,
+			err:     err,
+			startAt: startAt,
+			span:    span,
+			result:  result,
+		})
 	}()
 
 	route := r.Header.Get(internalapi.MCPRouteHeader)
@@ -142,26 +118,15 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Start a tracing span for the request, mirroring the legacy path. The span
-	// is closed in the deferred block below. Fan-out handlers additionally record
-	// per-backend routing on the span via RecordRouteToBackend.
-	var span tracingapi.MCPSpan
+	// Start a tracing span after validation. It is closed in recordPOSTCompletion
+	// (span is nil on early validation failures). Fan-out handlers additionally
+	// record per-backend routing via RecordRouteToBackend.
 	if params := modernParamsForHeaderMetadata(req); params != nil {
 		span = m.tracer.StartSpanAndInjectMeta(ctx, req, params, r.Header)
 	}
-	defer func() {
-		if span == nil {
-			return
-		}
-		if err != nil {
-			span.EndSpanOnError(string(errType), err)
-		} else {
-			span.EndSpan()
-		}
-	}()
 
 	// Dispatch based on method. Handlers return the resolved backend (when any)
-	// and an error so the deferred block can attribute metrics correctly.
+	// and an error so recordPOSTCompletion can attribute metrics correctly.
 	switch req.Method {
 	case "server/discover":
 		result, err = m.handleServerDiscover(ctx, w, req, route, span)
