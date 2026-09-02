@@ -38,6 +38,8 @@ const (
 	defaultCacheScope = "public"
 )
 
+var supportedVersions = []string{protocolVersion20260728, protocolVersion20251125, protocolVersion20250618}
+
 // serveModernPOST handles modern (2026-07-28) stateless POST requests.
 // This is the Phase 1 entry point for modern clients talking to modern backends.
 // The JSON-RPC request has already been parsed by servePOST.
