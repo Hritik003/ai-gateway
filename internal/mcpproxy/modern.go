@@ -17,7 +17,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,13 +33,9 @@ import (
 )
 
 const (
-	defaultTTLMs            = 0
-	defaultCacheScope       = "public"
-	protocolVersion20251125 = "25-11-2025"
+	defaultTTLMs      = 0
+	defaultCacheScope = "public"
 )
-
-var supportedVersions = []string{protocolVersion20260728, protocolVersion20251125, protocolVersion20250618}
-
 // serveModernPOST handles modern (2026-07-28) stateless POST requests.
 // This is the Phase 1 entry point for modern clients talking to modern backends.
 // The JSON-RPC request has already been parsed by servePOST.
@@ -60,7 +55,7 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 	// returns, not at defer registration. session and params are nil: modern
 	// requests are stateless and do not attach MCP params to metrics.
 	defer func() {
-		m.recordPOSTCompletion(postCompletion{
+		m.recordPOSTCompletion(&postCompletion{
 			ctx:     ctx,
 			method:  req.Method,
 			errType: errType,
@@ -198,7 +193,7 @@ func (m *mcpRequestContext) handleServerDiscover(ctx context.Context, w http.Res
 		onErrorResponse(w, http.StatusInternalServerError, "failed to discover any backend")
 		return handlerResult{}, errors.New("failed to discover any backend")
 	}
-	merged := mergeDiscoverResults(results)
+	merged := mergeDiscoverResults(m.l, results)
 	merged.Instructions = fmt.Sprintf("Envoy AI Gateway — MCP proxy aggregating %d backends", len(routeConfig.backends))
 	writeJSONRPCResult(w, req.ID, merged)
 	return handlerResult{}, nil
@@ -245,41 +240,35 @@ func discoverParams() []byte {
 //
 // Capabilities are aggregated using the same union/OR semantics as the stateful
 // initialize path
-func mergeDiscoverResults(results []*mcp.DiscoverResult) *mcp.DiscoverResult {
+func mergeDiscoverResults(l *slog.Logger, results []*mcp.DiscoverResult) *mcp.DiscoverResult {
 	caps := make([]*mcp.ServerCapabilities, 0, len(results))
 	cacheables := make([]mcp.Cacheable, 0, len(results))
-	for _, r := range results {
+	backends := make([]backendReportedVersions, 0, len(results))
+	for i, r := range results {
 		if r == nil {
 			continue
 		}
 		caps = append(caps, r.Capabilities)
 		cacheables = append(cacheables, r.Cacheable)
+		backends = append(backends, backendReportedVersions{
+			name:     fmt.Sprintf("backend[%d]", i),
+			versions: r.SupportedVersions,
+		})
 	}
 	ttlMs, cacheScope := mergeCachingHintsFromBackends(cacheables)
+
+	// Negotiate a single protocol version across backends using the same
+	// shared logic as the legacy initialize path. The modern flow always
+	// speaks 2026-07-28 with clients, so cap the negotiation at that version.
+	versions := []string{mergedProtocolVersion(l, protocolVersion20260728, backends)}
 	return &mcp.DiscoverResult{
-		SupportedVersions: mergeSupportedProtocolVersionsFromBackends(results),
+		SupportedVersions: versions,
 		Capabilities:      unionServerCapabilities(caps),
 		Cacheable: mcp.Cacheable{
 			TTLMs:      ttlMs,
 			CacheScope: cacheScope,
 		},
 	}
-}
-
-// mergeSupportedProtocolVersionsFromBackends merges the supported protocol versions from all servers.
-func mergeSupportedProtocolVersionsFromBackends(results []*mcp.DiscoverResult) []string {
-	versions := make([]string, 0, len(results))
-	for _, r := range results {
-		if r == nil {
-			continue
-		}
-		for _, v := range r.SupportedVersions {
-			if !slices.Contains(versions, v) {
-				versions = append(versions, v)
-			}
-		}
-	}
-	return versions
 }
 
 // handleModernToolsList handles tools/list on the modern stateless path (P1.7).
@@ -1088,12 +1077,7 @@ func ensureResultType(result json.RawMessage) json.RawMessage {
 
 // isSupportedVersion checks if a protocol version is in our supported set.
 func isSupportedVersion(v string) bool {
-	for _, sv := range supportedVersions {
-		if sv == v {
-			return true
-		}
-	}
-	return false
+	return v == protocolVersion20260728
 }
 
 // mergeCachingHintsFromBackends merges caching hints from multiple backends.
