@@ -129,13 +129,13 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 	case "tools/call":
 		result, err = m.handleModernToolsCall(ctx, w, r, req, route, span)
 	case "resources/read":
-		result, err = m.handleModernResourcesRead(ctx, w, req, route, span)
+		result, err = m.handleModernResourcesRead(ctx, w, r, req, route, span)
 	case "prompts/get":
-		result, err = m.handleModernPromptsGet(ctx, w, req, route, span)
+		result, err = m.handleModernPromptsGet(ctx, w, r, req, route, span)
 	case "subscriptions/listen":
-		result, err = m.handleSubscriptionsListen(ctx, w, req, route)
+		result, err = m.handleSubscriptionsListen(ctx, w, r, req, route)
 	case "completion/complete":
-		result, err = m.handleModernComplete(ctx, w, req, route, span)
+		result, err = m.handleModernComplete(ctx, w, r, req, route, span)
 	default:
 		errType = metrics.MCPErrorUnsupportedMethod
 		err = fmt.Errorf("unknown method: %s", req.Method)
@@ -148,8 +148,8 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 }
 
 // resolveModernRouteBackends looks up the route and evaluates backendSelector
-// against this request. The returned map is the only backend set discovery and
-// list fan-out may talk to. Writes 404 (unknown route) or 403 (no matching
+// against this request. The returned map is the only backend set modern
+// handlers may talk to. Writes 404 (unknown route) or 403 (no matching
 // backends) on failure.
 func (m *mcpRequestContext) resolveModernRouteBackends(w http.ResponseWriter, route filterapi.MCPRouteName) (*mcpProxyConfigRoute, map[filterapi.MCPBackendName]filterapi.MCPBackend, error) {
 	routeConfig, ok := m.routes[route]
@@ -163,6 +163,21 @@ func (m *mcpRequestContext) resolveModernRouteBackends(w http.ResponseWriter, ro
 		return nil, nil, err
 	}
 	return routeConfig, selected, nil
+}
+
+// lookupSelectedBackend returns the named backend from the already-selected
+// set produced by resolveModernRouteBackends. Writes 403 if the backend is on
+// the route but excluded by backendSelector, or 404 if it is unknown.
+func lookupSelectedBackend(w http.ResponseWriter, routeConfig *mcpProxyConfigRoute, selected map[filterapi.MCPBackendName]filterapi.MCPBackend, backendName string) (filterapi.MCPBackend, error) {
+	if backend, ok := selected[filterapi.MCPBackendName(backendName)]; ok {
+		return backend, nil
+	}
+	if _, onRoute := routeConfig.backends[filterapi.MCPBackendName(backendName)]; onRoute {
+		onErrorResponse(w, http.StatusForbidden, "access denied")
+		return filterapi.MCPBackend{}, errors.New("authorization failed")
+	}
+	onErrorResponse(w, http.StatusNotFound, fmt.Sprintf("unknown backend %s", backendName))
+	return filterapi.MCPBackend{}, fmt.Errorf("%w: %s", errBackendNotFound, backendName)
 }
 
 // handleServerDiscover fans out server/discover to selected backends, merges results.
@@ -365,10 +380,11 @@ func (m *mcpRequestContext) handleModernPromptsList(ctx context.Context, w http.
 // handleModernToolsCall handles tools/call on the modern stateless path (P1.5).
 // Routes to the single backend identified by the backend__toolName prefix.
 func (m *mcpRequestContext) handleModernToolsCall(ctx context.Context, w http.ResponseWriter, r *http.Request, req *jsonrpc.Request, route filterapi.MCPRouteName, span tracingapi.MCPSpan) (handlerResult, error) {
-	routeConfig, ok := m.routes[route]
-	if !ok {
-		onErrorResponse(w, http.StatusNotFound, "route not found")
-		return handlerResult{}, fmt.Errorf("%w: %s", errBackendNotFound, route)
+	m.requestHeaders = r.Header
+
+	routeConfig, selected, err := m.resolveModernRouteBackends(w, route)
+	if err != nil {
+		return handlerResult{}, err
 	}
 
 	// Extract tool name from params.
@@ -386,10 +402,9 @@ func (m *mcpRequestContext) handleModernToolsCall(ctx context.Context, w http.Re
 	}
 	result := handlerResult{backendName: backendName}
 
-	backend, ok := routeConfig.backends[filterapi.MCPBackendName(backendName)]
-	if !ok {
-		onErrorResponse(w, http.StatusNotFound, fmt.Sprintf("unknown backend %s", backendName))
-		return result, fmt.Errorf("%w: %s", errBackendNotFound, backendName)
+	backend, err := lookupSelectedBackend(w, routeConfig, selected, backendName)
+	if err != nil {
+		return result, err
 	}
 
 	// Enforce per-route tool selector filters.
@@ -452,11 +467,12 @@ func (m *mcpRequestContext) handleModernToolsCall(ctx context.Context, w http.Re
 }
 
 // handleModernResourcesRead handles resources/read (P1.5 single-target).
-func (m *mcpRequestContext) handleModernResourcesRead(ctx context.Context, w http.ResponseWriter, req *jsonrpc.Request, route filterapi.MCPRouteName, span tracingapi.MCPSpan) (handlerResult, error) {
-	routeConfig, ok := m.routes[route]
-	if !ok {
-		onErrorResponse(w, http.StatusNotFound, "route not found")
-		return handlerResult{}, fmt.Errorf("%w: %s", errBackendNotFound, route)
+func (m *mcpRequestContext) handleModernResourcesRead(ctx context.Context, w http.ResponseWriter, r *http.Request, req *jsonrpc.Request, route filterapi.MCPRouteName, span tracingapi.MCPSpan) (handlerResult, error) {
+	m.requestHeaders = r.Header
+
+	routeConfig, selected, err := m.resolveModernRouteBackends(w, route)
+	if err != nil {
+		return handlerResult{}, err
 	}
 
 	var params mcp.ReadResourceParams
@@ -472,10 +488,9 @@ func (m *mcpRequestContext) handleModernResourcesRead(ctx context.Context, w htt
 	}
 	result := handlerResult{backendName: backendName}
 
-	backend, ok := routeConfig.backends[filterapi.MCPBackendName(backendName)]
-	if !ok {
-		onErrorResponse(w, http.StatusNotFound, fmt.Sprintf("unknown backend %s", backendName))
-		return result, fmt.Errorf("%w: %s", errBackendNotFound, backendName)
+	backend, err := lookupSelectedBackend(w, routeConfig, selected, backendName)
+	if err != nil {
+		return result, err
 	}
 
 	params.URI = upstreamURI
@@ -569,11 +584,12 @@ func rewriteResourcesReadResult(result json.RawMessage, backendName string) (jso
 }
 
 // handleModernPromptsGet handles prompts/get (P1.5 single-target).
-func (m *mcpRequestContext) handleModernPromptsGet(ctx context.Context, w http.ResponseWriter, req *jsonrpc.Request, route filterapi.MCPRouteName, span tracingapi.MCPSpan) (handlerResult, error) {
-	routeConfig, ok := m.routes[route]
-	if !ok {
-		onErrorResponse(w, http.StatusNotFound, "route not found")
-		return handlerResult{}, fmt.Errorf("%w: %s", errBackendNotFound, route)
+func (m *mcpRequestContext) handleModernPromptsGet(ctx context.Context, w http.ResponseWriter, r *http.Request, req *jsonrpc.Request, route filterapi.MCPRouteName, span tracingapi.MCPSpan) (handlerResult, error) {
+	m.requestHeaders = r.Header
+
+	routeConfig, selected, err := m.resolveModernRouteBackends(w, route)
+	if err != nil {
+		return handlerResult{}, err
 	}
 
 	var params mcp.GetPromptParams
@@ -589,10 +605,9 @@ func (m *mcpRequestContext) handleModernPromptsGet(ctx context.Context, w http.R
 	}
 	result := handlerResult{backendName: backendName}
 
-	backend, ok := routeConfig.backends[filterapi.MCPBackendName(backendName)]
-	if !ok {
-		onErrorResponse(w, http.StatusNotFound, fmt.Sprintf("unknown backend %s", backendName))
-		return result, fmt.Errorf("%w: %s", errBackendNotFound, backendName)
+	backend, err := lookupSelectedBackend(w, routeConfig, selected, backendName)
+	if err != nil {
+		return result, err
 	}
 
 	params.Name = upstreamName
@@ -617,14 +632,15 @@ func (m *mcpRequestContext) handleModernPromptsGet(ctx context.Context, w http.R
 }
 
 // handleModernComplete handles completion/complete (P1.5 single-target).
-func (m *mcpRequestContext) handleModernComplete(ctx context.Context, w http.ResponseWriter, req *jsonrpc.Request, route filterapi.MCPRouteName, span tracingapi.MCPSpan) (handlerResult, error) {
-	// completion/complete targets a specific resource by ref; for the POC just proxy to first backend.
-	routeConfig, ok := m.routes[route]
-	if !ok {
-		onErrorResponse(w, http.StatusNotFound, "route not found")
-		return handlerResult{}, fmt.Errorf("%w: %s", errBackendNotFound, route)
+func (m *mcpRequestContext) handleModernComplete(ctx context.Context, w http.ResponseWriter, r *http.Request, req *jsonrpc.Request, route filterapi.MCPRouteName, span tracingapi.MCPSpan) (handlerResult, error) {
+	m.requestHeaders = r.Header
+
+	// completion/complete targets a specific resource by ref; for the POC just proxy to first selected backend.
+	_, selected, err := m.resolveModernRouteBackends(w, route)
+	if err != nil {
+		return handlerResult{}, err
 	}
-	for _, backend := range routeConfig.backends {
+	for _, backend := range selected {
 		resp, err := m.sendModernRequest(ctx, req, route, backend)
 		if err != nil {
 			continue
@@ -646,13 +662,13 @@ func (m *mcpRequestContext) handleModernComplete(ctx context.Context, w http.Res
 // does not fit the request-duration metric shape. It sets
 // perBackendMetricsRecorded to skip the generic recording in serveModernPOST,
 // mirroring how the legacy path treats streaming/notification methods.
-func (m *mcpRequestContext) handleSubscriptionsListen(ctx context.Context, w http.ResponseWriter, req *jsonrpc.Request, route filterapi.MCPRouteName) (handlerResult, error) {
+func (m *mcpRequestContext) handleSubscriptionsListen(ctx context.Context, w http.ResponseWriter, r *http.Request, req *jsonrpc.Request, route filterapi.MCPRouteName) (handlerResult, error) {
 	m.perBackendMetricsRecorded = true
+	m.requestHeaders = r.Header
 
-	routeConfig, ok := m.routes[route]
-	if !ok {
-		onErrorResponse(w, http.StatusNotFound, "route not found")
-		return handlerResult{}, fmt.Errorf("%w: %s", errBackendNotFound, route)
+	_, selected, err := m.resolveModernRouteBackends(w, route)
+	if err != nil {
+		return handlerResult{}, err
 	}
 
 	// Set SSE response headers.
@@ -665,13 +681,13 @@ func (m *mcpRequestContext) handleSubscriptionsListen(ctx context.Context, w htt
 		flusher.Flush()
 	}
 
-	// Fan out subscriptions/listen to all backends and parse each stream so we
-	// can rewrite backend-scoped notification payloads (e.g. resources/updated
-	// URIs) into the gateway's downstream namespace before forwarding.
+	// Fan out subscriptions/listen to the selected backends and parse each
+	// stream so we can rewrite backend-scoped notification payloads (e.g.
+	// resources/updated URIs) into the gateway's downstream namespace before forwarding.
 	var backendResps []*http.Response
 	events := make(chan *sseEvent)
 	var wg sync.WaitGroup
-	for _, backend := range routeConfig.backends {
+	for _, backend := range selected {
 		body, _ := jsonrpc.EncodeMessage(req)
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, m.backendListenerAddr, bytes.NewReader(body))
 		if err != nil {
