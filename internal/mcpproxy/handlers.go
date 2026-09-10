@@ -404,19 +404,21 @@ type (
 func (m *mcpRequestContext) mergeToolsList(s *session, responses []broadCastResponse[mcp.ListToolsResult]) mcp.ListToolsResult {
 	// Use a non-nil empty slice so JSON encodes as [] not null; some clients reject tools:null.
 	resp := mcp.ListToolsResult{Tools: make([]*mcp.Tool, 0)}
-	cacheables := make([]mcp.Cacheable, 0, len(responses))
 	route := m.routes[s.route]
 	if route == nil {
 		// This should never happen as the route must have been validated when the session is created.
 		return resp
 	}
 
-	// Aggregate the tools from all responses.
-	// A backend specific prefix is added to the tool name to avoid name collision.
-	// The tools are filtered based on the toolFilters configured for each backend,
-	// and additionally by authorization rules so callers only see tools they can invoke.
+	// Aggregate tools from all backends. Per-backend PrefixMode controls whether a backend's
+	// tools are prefixed with "<backendName>__" (Always) or exposed as bare names (Never).
+	// Never-mode bare names are exactly the ones in route.neverModeToolIndex, a static map
+	// computed at config load from each Never-mode backend's declared toolSelector.include
+	// (admission-validated for cross-backend uniqueness), so no runtime collision bookkeeping
+	// is needed for them here. Always-mode backends prefix inline; both can coexist on the
+	// same route. Tools are filtered by toolSelector and authorization before inclusion.
 	for _, r := range responses {
-		cacheables = append(cacheables, r.res.Cacheable)
+		backendMode := route.effectivePrefixMode(r.backendName)
 		selector := route.toolSelectors[r.backendName]
 		for _, tool := range r.res.Tools {
 			if selector != nil && !selector.allows(tool.Name) {
@@ -433,16 +435,23 @@ func (m *mcpRequestContext) mergeToolsList(s *session, responses []broadCastResp
 					continue
 				}
 			}
-			tool.Name = downstreamResourceName(tool.Name, r.backendName)
+			if backendMode != filterapi.PrefixModeNever {
+				prefixed := downstreamResourceName(tool.Name, r.backendName)
+				// Guard against an Always-mode backend's prefixed name accidentally colliding
+				// with a bare name a Never-mode backend on this route declared ownership of.
+				if owner, collision := route.neverModeToolIndex[prefixed]; collision {
+					m.l.Warn("dropping MCP tool name that collides with a prefixMode=Never backend's declared bare name",
+						slog.String("tool", prefixed),
+						slog.String("always_mode_backend", r.backendName),
+						slog.String("never_mode_backend", owner),
+					)
+					continue
+				}
+				tool.Name = prefixed
+			}
 			rewriteMetaResourceURIs(tool.Meta, r.backendName)
 			resp.Tools = append(resp.Tools, tool)
 		}
-	}
-
-	ttlMs, cacheScope := mergeCachingHintsFromBackends(cacheables)
-	resp.Cacheable = mcp.Cacheable{
-		TTLMs:      ttlMs,
-		CacheScope: cacheScope,
 	}
 
 	return resp
@@ -454,19 +463,12 @@ func (m *mcpRequestContext) mergeResourceList(_ *session, responses []broadCastR
 	// TODO: do we need a more sophisticated merging logic here?
 	// TODO: how to handle NextCursor?
 	resp := mcp.ListResourcesResult{Resources: make([]*mcp.Resource, 0)}
-	cacheables := make([]mcp.Cacheable, 0, len(responses))
 	for _, r := range responses {
-		cacheables = append(cacheables, r.res.Cacheable)
 		for _, res := range r.res.Resources {
 			res.Name = downstreamResourceName(res.Name, r.backendName)
 			res.URI = downstreamResourceURI(res.URI, r.backendName)
 			resp.Resources = append(resp.Resources, res)
 		}
-	}
-	ttlMs, cacheScope := mergeCachingHintsFromBackends(cacheables)
-	resp.Cacheable = mcp.Cacheable{
-		TTLMs:      ttlMs,
-		CacheScope: cacheScope,
 	}
 	return resp
 }
@@ -474,39 +476,55 @@ func (m *mcpRequestContext) mergeResourceList(_ *session, responses []broadCastR
 // mergeResourcesTemplateList merges the list of resource templates from all backends and prepare the response message to be sent back to the client.
 func (m *mcpRequestContext) mergeResourcesTemplateList(_ *session, responses []broadCastResponse[mcp.ListResourceTemplatesResult]) mcp.ListResourceTemplatesResult {
 	resp := mcp.ListResourceTemplatesResult{ResourceTemplates: make([]*mcp.ResourceTemplate, 0)}
-	cacheables := make([]mcp.Cacheable, 0, len(responses))
 	for _, r := range responses {
-		cacheables = append(cacheables, r.res.Cacheable)
 		for _, res := range r.res.ResourceTemplates {
 			res.Name = downstreamResourceName(res.Name, r.backendName)
 			res.URITemplate = downstreamResourceURI(res.URITemplate, r.backendName)
 			resp.ResourceTemplates = append(resp.ResourceTemplates, res)
 		}
 	}
-	ttlMs, cacheScope := mergeCachingHintsFromBackends(cacheables)
-	resp.Cacheable = mcp.Cacheable{
-		TTLMs:      ttlMs,
-		CacheScope: cacheScope,
-	}
 	return resp
 }
 
 // mergePromptsList merges the list of prompts from all backends and prepare the response message to be sent back to the client.
-func (m *mcpRequestContext) mergePromptsList(_ *session, responses []broadCastResponse[mcp.ListPromptsResult]) mcp.ListPromptsResult {
+func (m *mcpRequestContext) mergePromptsList(s *session, responses []broadCastResponse[mcp.ListPromptsResult]) mcp.ListPromptsResult {
 	// Aggregate the resources from all responses with some logic to match the actual proxy behavior.
 	aggregatedResponse := mcp.ListPromptsResult{Prompts: make([]*mcp.Prompt, 0)}
-	cacheables := make([]mcp.Cacheable, 0, len(responses))
+	route := m.routes[s.route]
 	for _, r := range responses {
-		cacheables = append(cacheables, r.res.Cacheable)
+		backendMode := filterapi.PrefixModeAlways
+		var selector *toolSelector
+		var neverModePromptIndex map[string]string
+		if route != nil {
+			backendMode = route.effectivePrefixMode(r.backendName)
+			selector = route.promptSelectors[r.backendName]
+			neverModePromptIndex = route.neverModePromptIndex
+		}
 		for _, res := range r.res.Prompts {
-			res.Name = downstreamResourceName(res.Name, r.backendName)
+			if selector != nil && !selector.allows(res.Name) {
+				continue
+			}
+			// A prompt is exposed bare only when this backend is in Never mode AND it opted in
+			// by declaring this exact name via promptSelector.include (statically indexed in
+			// route.neverModePromptIndex at config load — see MCPPromptFilter). Backends that
+			// don't declare a promptSelector keep the "<backendName>__" prefix even under Never
+			// mode, since there's no admission-validated, unique name set to expose bare for them.
+			if backendMode == filterapi.PrefixModeNever && neverModePromptIndex[res.Name] == r.backendName {
+				aggregatedResponse.Prompts = append(aggregatedResponse.Prompts, res)
+				continue
+			}
+			prefixed := downstreamResourceName(res.Name, r.backendName)
+			if owner, collision := neverModePromptIndex[prefixed]; collision {
+				m.l.Warn("dropping MCP prompt name that collides with a prefixMode=Never backend's declared bare name",
+					slog.String("prompt", prefixed),
+					slog.String("backend", r.backendName),
+					slog.String("never_mode_backend", owner),
+				)
+				continue
+			}
+			res.Name = prefixed
 			aggregatedResponse.Prompts = append(aggregatedResponse.Prompts, res)
 		}
-	}
-	ttlMs, cacheScope := mergeCachingHintsFromBackends(cacheables)
-	aggregatedResponse.Cacheable = mcp.Cacheable{
-		TTLMs:      ttlMs,
-		CacheScope: cacheScope,
 	}
 	return aggregatedResponse
 }
