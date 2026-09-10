@@ -454,6 +454,7 @@ func (m *mcpRequestContext) mergeToolsList(s *session, responses []broadCastResp
 		}
 	}
 
+	applyMergedCachingHints(&resp.Cacheable, responses)
 	return resp
 }
 
@@ -470,6 +471,7 @@ func (m *mcpRequestContext) mergeResourceList(_ *session, responses []broadCastR
 			resp.Resources = append(resp.Resources, res)
 		}
 	}
+	applyMergedCachingHints(&resp.Cacheable, responses)
 	return resp
 }
 
@@ -483,6 +485,7 @@ func (m *mcpRequestContext) mergeResourcesTemplateList(_ *session, responses []b
 			resp.ResourceTemplates = append(resp.ResourceTemplates, res)
 		}
 	}
+	applyMergedCachingHints(&resp.Cacheable, responses)
 	return resp
 }
 
@@ -526,5 +529,6 @@ func (m *mcpRequestContext) mergePromptsList(s *session, responses []broadCastRe
 			aggregatedResponse.Prompts = append(aggregatedResponse.Prompts, res)
 		}
 	}
+	applyMergedCachingHints(&aggregatedResponse.Cacheable, responses)
 	return aggregatedResponse
 }
