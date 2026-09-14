@@ -30,6 +30,10 @@ import (
 	"github.com/envoyproxy/ai-gateway/internal/tracing/tracingapi"
 )
 
+// errModernListNoBackends is returned when list fan-out is invoked with an empty
+// backend set (e.g. nothing selected) or every selected backend failed.
+var errModernListNoBackends = errors.New("list request failed for all backends")
+
 const (
 	defaultTTLMs      = 0
 	defaultCacheScope = "public"
@@ -340,7 +344,11 @@ func (m *mcpRequestContext) handleModernToolsList(ctx context.Context, w http.Re
 		return handlerResult{}, err
 	}
 
-	responses := sendToAllModernBackendsAndAggregateResponses[mcp.ListToolsResult](ctx, m, req, route, selected, span)
+	responses, err := sendToAllModernBackendsAndAggregateResponses[mcp.ListToolsResult](ctx, m, req, route, selected, span)
+	if err != nil {
+		onErrorResponse(w, http.StatusInternalServerError, "failed to list tools for all backends")
+		return handlerResult{}, err
+	}
 	result := m.mergeToolsList(&session{route: route}, responses)
 	if span != nil {
 		span.RecordListResult(result)
@@ -363,7 +371,11 @@ func (m *mcpRequestContext) handleModernResourcesList(ctx context.Context, w htt
 		return handlerResult{}, err
 	}
 
-	responses := sendToAllModernBackendsAndAggregateResponses[mcp.ListResourcesResult](ctx, m, req, route, selected, span)
+	responses, err := sendToAllModernBackendsAndAggregateResponses[mcp.ListResourcesResult](ctx, m, req, route, selected, span)
+	if err != nil {
+		onErrorResponse(w, http.StatusInternalServerError, "failed to list resources for all backends")
+		return handlerResult{}, err
+	}
 	result := m.mergeResourceList(&session{route: route}, responses)
 	if span != nil {
 		span.RecordListResult(result)
@@ -384,7 +396,11 @@ func (m *mcpRequestContext) handleModernResourceTemplatesList(ctx context.Contex
 	if err != nil {
 		return handlerResult{}, err
 	}
-	responses := sendToAllModernBackendsAndAggregateResponses[mcp.ListResourceTemplatesResult](ctx, m, req, route, selected, span)
+	responses, err := sendToAllModernBackendsAndAggregateResponses[mcp.ListResourceTemplatesResult](ctx, m, req, route, selected, span)
+	if err != nil {
+		onErrorResponse(w, http.StatusInternalServerError, "failed to list resource templates for all backends")
+		return handlerResult{}, err
+	}
 	result := m.mergeResourcesTemplateList(&session{route: route}, responses)
 	if span != nil {
 		span.RecordListResult(result)
@@ -407,7 +423,11 @@ func (m *mcpRequestContext) handleModernPromptsList(ctx context.Context, w http.
 		return handlerResult{}, err
 	}
 
-	responses := sendToAllModernBackendsAndAggregateResponses[mcp.ListPromptsResult](ctx, m, req, route, selected, span)
+	responses, err := sendToAllModernBackendsAndAggregateResponses[mcp.ListPromptsResult](ctx, m, req, route, selected, span)
+	if err != nil {
+		onErrorResponse(w, http.StatusInternalServerError, "failed to list prompts for all backends")
+		return handlerResult{}, err
+	}
 	result := m.mergePromptsList(&session{route: route}, responses)
 	if span != nil {
 		span.RecordListResult(result)
@@ -423,6 +443,9 @@ func (m *mcpRequestContext) handleModernPromptsList(ctx context.Context, w http.
 // mirroring the "partial failure is non-fatal" behavior of the legacy aggregation
 // path (sendToAllBackendsAndAggregateResponses).
 //
+// Returns errModernListNoBackends when backends is empty or every backend fails — callers
+// should surface that as a hard error rather than an empty successful list.
+//
 // Callers must pass the set from resolveModernRouteBackends / selectBackends; this
 // function does not re-evaluate backendSelector.
 //
@@ -430,9 +453,13 @@ func (m *mcpRequestContext) handleModernPromptsList(ctx context.Context, w http.
 // aggregation input so the modern handlers can reuse the same merge* functions
 // (mergeToolsList, mergeResourceList, ...) and avoid drifting from the legacy
 // prefixing/filtering/authorization/caching-hint logic.
-func sendToAllModernBackendsAndAggregateResponses[T any](ctx context.Context, m *mcpRequestContext, req *jsonrpc.Request, route filterapi.MCPRouteName, backends map[filterapi.MCPBackendName]filterapi.MCPBackend, span tracingapi.MCPSpan) []broadCastResponse[T] {
+func sendToAllModernBackendsAndAggregateResponses[T any](ctx context.Context, m *mcpRequestContext, req *jsonrpc.Request, route filterapi.MCPRouteName, backends map[filterapi.MCPBackendName]filterapi.MCPBackend, span tracingapi.MCPSpan) ([]broadCastResponse[T], error) {
 	if span != nil {
 		span.AddEvent(req.Method + " aggregation begin")
+	}
+	if len(backends) == 0 {
+		m.l.Error(fmt.Sprintf("%s has no backends selected", req.Method), slog.String("route", route))
+		return nil, fmt.Errorf("%w: %s has no backends selected for route %s", errModernListNoBackends, req.Method, route)
 	}
 	responses := make([]broadCastResponse[T], 0, len(backends))
 	for backendName, backend := range backends {
@@ -465,7 +492,11 @@ func sendToAllModernBackendsAndAggregateResponses[T any](ctx context.Context, m 
 		backendMetrics.RecordRequestDuration(ctx, backendStartAt, nil)
 		responses = append(responses, broadCastResponse[T]{backendName: backendName, res: result})
 	}
-	return responses
+	if len(responses) == 0 {
+		m.l.Error(fmt.Sprintf("%s failed for all backends", req.Method), slog.String("route", route))
+		return nil, fmt.Errorf("%w: %s failed for all backends on route %s", errModernListNoBackends, req.Method, route)
+	}
+	return responses, nil
 }
 
 // sendModernRequest sends a JSON-RPC request to a modern backend with proper headers (P1.6).

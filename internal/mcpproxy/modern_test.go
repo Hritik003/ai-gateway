@@ -646,7 +646,7 @@ func TestHandleModernPromptsList_RouteNotFound(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// sendToAllModernBackendsAndAggregateResponses partial failure handling
+// sendToAllModernBackendsAndAggregateResponses partial / complete failure handling
 // -----------------------------------------------------------------------------
 
 func TestSendToAllModernBackends_PartialFailure(t *testing.T) {
@@ -661,9 +661,9 @@ func TestSendToAllModernBackends_PartialFailure(t *testing.T) {
 	proxy.requestHeaders = http.Header{}
 	req := modernReq(t, "tools/list", nil)
 
-	responses := sendToAllModernBackendsAndAggregateResponses[mcp.ListToolsResult](
+	responses, err := sendToAllModernBackendsAndAggregateResponses[mcp.ListToolsResult](
 		context.Background(), proxy, req, "test-route", proxy.routes["test-route"].backends, nil)
-
+	require.NoError(t, err)
 	require.Len(t, responses, 1)
 	require.Equal(t, "backend2", responses[0].backendName)
 }
@@ -689,11 +689,71 @@ func TestSendToAllModernBackends_UnmarshalFailureSkipped(t *testing.T) {
 	proxy.requestHeaders = http.Header{}
 	req := modernReq(t, "tools/list", nil)
 
-	responses := sendToAllModernBackendsAndAggregateResponses[mcp.ListToolsResult](
+	responses, err := sendToAllModernBackendsAndAggregateResponses[mcp.ListToolsResult](
 		context.Background(), proxy, req, "test-route", proxy.routes["test-route"].backends, nil)
-
+	require.NoError(t, err)
 	require.Len(t, responses, 1)
 	require.Equal(t, "backend2", responses[0].backendName)
+}
+
+func TestSendToAllModernBackends_NoBackendsSelected(t *testing.T) {
+	proxy := newTestMCPProxy()
+	proxy.requestHeaders = http.Header{}
+	req := modernReq(t, "tools/list", nil)
+
+	responses, err := sendToAllModernBackendsAndAggregateResponses[mcp.ListToolsResult](
+		context.Background(), proxy, req, "test-route", map[filterapi.MCPBackendName]filterapi.MCPBackend{}, nil)
+	require.ErrorIs(t, err, errModernListNoBackends)
+	require.Contains(t, err.Error(), "no backends selected")
+	require.Nil(t, responses)
+}
+
+func TestHandleModernToolsList_PartialFailure(t *testing.T) {
+	respFn := func(backend, _ string) any {
+		return mcp.ListToolsResult{Tools: []*mcp.Tool{{Name: "search"}}}
+	}
+	server := httptest.NewServer(modernBackendHandler(t, nil, map[string]bool{"backend1": true}, respFn))
+	defer server.Close()
+
+	proxy := newTestMCPProxy()
+	proxy.backendListenerAddr = server.URL
+	delete(proxy.routes["test-route"].toolSelectors, "backend1")
+	delete(proxy.routes["test-route"].toolSelectors, "backend2")
+
+	r := newModernRequest("tools/list")
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "tools/list", nil)
+
+	_, err := proxy.handleModernToolsList(context.Background(), rr, r, req, "test-route", nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	result := decodeResult(t, rr)
+	var tools struct {
+		Tools []*mcp.Tool `json:"tools"`
+	}
+	require.NoError(t, json.Unmarshal(fmt.Appendf(nil, `{"tools":%s}`, result["tools"]), &tools))
+	require.Len(t, tools.Tools, 1)
+	require.Equal(t, downstreamResourceName("search", "backend2"), tools.Tools[0].Name)
+}
+
+func TestHandleModernToolsList_AllBackendsFail(t *testing.T) {
+	respFn := func(backend, _ string) any {
+		return mcp.ListToolsResult{Tools: []*mcp.Tool{{Name: "search"}}}
+	}
+	server := httptest.NewServer(modernBackendHandler(t, nil, map[string]bool{"backend1": true, "backend2": true}, respFn))
+	defer server.Close()
+
+	proxy := newTestMCPProxy()
+	proxy.backendListenerAddr = server.URL
+
+	r := newModernRequest("tools/list")
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "tools/list", nil)
+
+	_, err := proxy.handleModernToolsList(context.Background(), rr, r, req, "test-route", nil)
+	require.ErrorIs(t, err, errModernListNoBackends)
+	require.Equal(t, http.StatusInternalServerError, rr.Code)
 }
 
 // -----------------------------------------------------------------------------
