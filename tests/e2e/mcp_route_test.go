@@ -434,6 +434,7 @@ func requireSignMCPBackendSubsetJWT(t *testing.T, priv *rsa.PrivateKey, backends
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
 		"mcp_backends": backends,
 		"exp":          time.Now().Add(time.Hour).Unix(),
+		"iss":          "https://example.com",
 	})
 	token.Header["kid"] = mcpBackendSelectorJWTKeyID
 	signed, err := token.SignedString(priv)
