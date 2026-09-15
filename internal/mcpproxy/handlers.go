@@ -104,7 +104,23 @@ func (m *mcpRequestContext) servePOST(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// TODO: Detect era: modern or legacy
+	// detect the client era and handle the request accordingly.
+	detection := detectClientEra(r, rawMsg)
+	if detection.err != nil {
+		onErrorResponse(w, detection.err.HTTPStatus, detection.err.Message)
+		return
+	}
+
+	// route to modern handler, if the client is using the modern MCP spec.
+	if detection.era == eraModern {
+		req, ok := rawMsg.(*jsonrpc.Request)
+		if !ok || req == nil {
+			onErrorResponse(w, http.StatusBadRequest, "invalid JSON-RPC message: expected request")
+			return
+		}
+		m.serveModernPOST(w, r, req, startAt)
+		return
+	}
 
 	m.serveLegacyPOST(w, r, rawMsg, startAt)
 }

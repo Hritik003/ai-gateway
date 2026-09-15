@@ -813,6 +813,60 @@ func TestServePOST_InvalidJSONRPC(t *testing.T) {
 	require.Contains(t, rr.Body.String(), "invalid JSON-RPC message")
 }
 
+// TestServePOST_EraDispatch covers the era detection branch in servePOST:
+// detection errors are returned as-is, and a modern-era request is handed to
+// serveModernPOST (rather than the legacy session path).
+func TestServePOST_EraDispatch(t *testing.T) {
+	caps, err := json.Marshal(mcp.ClientCapabilities{})
+	require.NoError(t, err)
+	modernParams := modernMeta(protocolVersion20260728, caps)
+
+	t.Run("detection error is returned", func(t *testing.T) {
+		// A JSON-RPC *response* on a modern POST is rejected by detectClientEra
+		// before either era handler runs. This also covers the servePOST guard
+		// that expects a *jsonrpc.Request before calling serveModernPOST —
+		// detectClientEra rejects responses first, so the type assertion is
+		// never reached for this input.
+		id, err := jsonrpc.MakeID("1")
+		require.NoError(t, err)
+		body, err := jsonrpc.EncodeMessage(&jsonrpc.Response{ID: id, Result: []byte(`{}`)})
+		require.NoError(t, err)
+
+		req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(string(body)))
+		req.Header.Set(internalapi.MCPRouteHeader, "test-route")
+		req.Header.Set(mcpProtocolVersionHeader, protocolVersion20260728)
+		req.Header.Set(mcpMethodHeader, "tools/list")
+		rr := httptest.NewRecorder()
+
+		newTestMCPProxy().servePOST(rr, req)
+
+		require.Equal(t, http.StatusBadRequest, rr.Code)
+		require.Contains(t, rr.Body.String(), "JSON-RPC responses are not valid on the modern POST path")
+		// Must not have reached serveModernPOST (which would complain about routing).
+		require.NotContains(t, rr.Body.String(), "missing route header")
+		require.NotContains(t, rr.Body.String(), "unknown method")
+	})
+
+	t.Run("modern request routes to serveModernPOST", func(t *testing.T) {
+		// Use a method that passes modern era validation but is unknown to
+		// serveModernPOST. The modern "unknown method" 404 proves servePOST
+		// dispatched to the modern path (legacy would have required a session).
+		body, err := jsonrpc.EncodeMessage(modernReq(t, "tools/frobnicate", modernParams))
+		require.NoError(t, err)
+
+		req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(string(body)))
+		req.Header.Set(internalapi.MCPRouteHeader, "test-route")
+		req.Header.Set(mcpProtocolVersionHeader, protocolVersion20260728)
+		req.Header.Set(mcpMethodHeader, "tools/frobnicate")
+		rr := httptest.NewRecorder()
+
+		newTestMCPProxy().servePOST(rr, req)
+
+		require.Equal(t, http.StatusNotFound, rr.Code)
+		require.Contains(t, rr.Body.String(), "unknown method")
+	})
+}
+
 func TestServePOST_OversizedBody(t *testing.T) {
 	proxy := newTestMCPProxy()
 	proxy.maxRequestBodySize = 16 // tiny limit to exercise the guard without allocating a large buffer.

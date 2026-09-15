@@ -389,3 +389,67 @@ func backendsFromSpan(t *testing.T, span *tracev1.Span) []string {
 	}
 	return backends
 }
+
+// modernMCPEnv holds the test environment for modern (2026-07-28) MCP dataplane tests.
+// Unlike mcpEnv it uses a stateless modernClient instead of the go-sdk mcp.Client.
+type modernMCPEnv struct {
+	modernCli         *modernClient
+	extProcMetricsURL string
+	baseURL           string
+	env               *dataplaneenv.TestEnvironment
+	collector         *testotel.OTLPCollector
+}
+
+// requireNewModernMCPEnv sets up a test environment with modern (2026-07-28) MCP backend servers.
+func requireNewModernMCPEnv(t *testing.T, writeTimeout time.Duration, path string) *modernMCPEnv {
+	t.Helper()
+
+	internaltesting.ClearTestEnv(t)
+
+	collector := testotel.StartOTLPCollector()
+	t.Cleanup(collector.Close)
+	mcpConfig := &filterapi.MCPConfig{
+		BackendListenerAddr: "http://127.0.0.1:9999",
+		Routes: []filterapi.MCPRoute{
+			{
+				Name: "test-route",
+				Backends: []filterapi.MCPBackend{
+					{Name: "dumb-mcp-backend"},
+					{Name: "default-mcp-backend"},
+				},
+			},
+		},
+	}
+	config, err := json.Marshal(filterapi.Config{MCPConfig: mcpConfig, Version: version.Parse()})
+	require.NoError(t, err)
+
+	env := dataplaneenv.StartTestEnvironment(t,
+		func(_ testing.TB, _ io.Writer, ports map[string]int) {
+			srv1 := testmcp.NewModernServer(&testmcp.ModernOptions{
+				Port:           ports["ts1"],
+				DumbEchoServer: false,
+				WriteTimeout:   writeTimeout,
+			})
+			srv2 := testmcp.NewModernServer(&testmcp.ModernOptions{
+				Port:           ports["ts2"],
+				DumbEchoServer: true,
+				WriteTimeout:   writeTimeout,
+			})
+			t.Cleanup(func() {
+				_ = srv1.Close()
+				_ = srv2.Close()
+			})
+		}, map[string]int{"ts1": 8080, "ts2": 8081, "special_listener": 9999},
+		string(config), collector.Env(), envoyConfig, true, true,
+		writeTimeout,
+	)
+
+	m := &modernMCPEnv{
+		collector:         collector,
+		extProcMetricsURL: fmt.Sprintf("http://localhost:%d/metrics", env.ExtProcAdminPort()),
+		baseURL:           fmt.Sprintf("http://localhost:%d%s", env.EnvoyListenerPort(), path),
+		env:               env,
+	}
+	m.modernCli = newModernClient(m.baseURL)
+	return m
+}

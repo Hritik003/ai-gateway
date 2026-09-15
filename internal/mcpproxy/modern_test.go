@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -151,14 +152,13 @@ func TestServeModernPOST_UnknownMethod(t *testing.T) {
 }
 
 func TestServeModernPOST_StartsSpanOnlyForSupportedMethods(t *testing.T) {
-	// tools/call is not yet a modern-supported method; a span must not be
-	// opened just because modernParamsForHeaderMetadata can parse it.
+	// An unknown method must not open a span even if it carries parseable params.
 	t.Run("unknown method", func(t *testing.T) {
 		tracer := &fakeTracer{}
 		proxy := newTestMCPProxyWithTracer(tracer)
-		r := newModernRequest("tools/call")
+		r := newModernRequest("tools/frobnicate")
 		rr := httptest.NewRecorder()
-		req := modernReq(t, "tools/call", []byte(`{"name":"t"}`))
+		req := modernReq(t, "tools/frobnicate", []byte(`{"name":"t"}`))
 
 		proxy.serveModernPOST(rr, r, req, time.Now())
 
@@ -1014,6 +1014,401 @@ func TestResolveModernRouteBackends_PerBackendHeadersOnlyForSelected(t *testing.
 	require.Equal(t, map[filterapi.MCPBackendName]filterapi.MCPBackend{"backend2": b2}, selected)
 	require.NotContains(t, proxy.perBackendExtraHeaders, "backend1")
 	require.Equal(t, "secret-b2", proxy.perBackendExtraHeaders["backend2"]["X-B2"])
+}
+
+// -----------------------------------------------------------------------------
+// Single-target handlers (tools/call, resources/read, prompts/get,
+// completion/complete, subscriptions/listen)
+// -----------------------------------------------------------------------------
+
+// TestServeModernPOST_DispatchSingleTarget drives each single-target method end-to-end
+// through serveModernPOST against a live backend, asserting the backend receives the
+// unprefixed name/URI and the client sees a complete result.
+func TestServeModernPOST_DispatchSingleTarget(t *testing.T) {
+	tests := []struct {
+		method      string
+		params      []byte
+		wantName    string // expected unprefixed name/uri seen by the backend
+		wantBackend string
+	}{
+		{
+			method:      "tools/call",
+			params:      fmt.Appendf(nil, `{"name":%q}`, downstreamResourceName("do-it", "backend2")),
+			wantName:    "do-it",
+			wantBackend: "backend2",
+		},
+		{
+			method:      "resources/read",
+			params:      fmt.Appendf(nil, `{"uri":%q}`, downstreamResourceURI("file:///cfg", "backend2")),
+			wantName:    "file:///cfg",
+			wantBackend: "backend2",
+		},
+		{
+			method:      "prompts/get",
+			params:      fmt.Appendf(nil, `{"name":%q}`, downstreamResourceName("greet", "backend2")),
+			wantName:    "greet",
+			wantBackend: "backend2",
+		},
+		{
+			method:      "completion/complete",
+			params:      fmt.Appendf(nil, `{"ref":{"type":"ref/prompt","name":%q},"argument":{"name":"a","value":"v"}}`, downstreamResourceName("greet", "backend2")),
+			wantName:    "greet",
+			wantBackend: "backend2",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.method, func(t *testing.T) {
+			var gotName, gotBackend string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotBackend = r.Header.Get(internalapi.MCPBackendHeader)
+				body, _ := io.ReadAll(r.Body)
+				var env struct {
+					ID     json.RawMessage `json:"id"`
+					Params struct {
+						Name string `json:"name"`
+						URI  string `json:"uri"`
+						Ref  struct {
+							Name string `json:"name"`
+						} `json:"ref"`
+					} `json:"params"`
+				}
+				require.NoError(t, json.Unmarshal(body, &env))
+				gotName = cmpOr(env.Params.Name, env.Params.URI, env.Params.Ref.Name)
+				resp := fmt.Appendf(nil, `{"jsonrpc":"2.0","id":%s,"result":{}}`, env.ID)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write(resp)
+			}))
+			defer server.Close()
+
+			proxy := newTestMCPProxy()
+			proxy.backendListenerAddr = server.URL
+			// backend2 has no tool selector, so calls flow through unrestricted.
+
+			r := newModernRequest(tc.method)
+			rr := httptest.NewRecorder()
+			req := modernReq(t, tc.method, tc.params)
+
+			proxy.serveModernPOST(rr, r, req, time.Now())
+
+			require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+			require.Equal(t, tc.wantBackend, gotBackend)
+			require.Equal(t, tc.wantName, gotName, "backend must receive the unprefixed name/uri")
+			result := decodeResult(t, rr)
+			require.Equal(t, `"complete"`, string(result["resultType"]))
+		})
+	}
+}
+
+func TestHandleModernToolsCall_RewritesResultURIs(t *testing.T) {
+	// Backend returns a ResourceLink with an upstream URI; the gateway must
+	// re-prefix it into the downstream namespace before returning to the client.
+	respFn := func(_, _ string) any {
+		return mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.ResourceLink{URI: "file:///data"}},
+		}
+	}
+	server := httptest.NewServer(modernBackendHandler(t, nil, nil, respFn))
+	defer server.Close()
+
+	proxy := newTestMCPProxy()
+	proxy.backendListenerAddr = server.URL
+
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "tools/call", fmt.Appendf(nil, `{"name":%q}`, downstreamResourceName("do-it", "backend2")))
+	_, err := proxy.handleModernToolsCall(context.Background(), rr, newModernRequest("tools/call"), req, "test-route", nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	var out mcp.CallToolResult
+	require.NoError(t, json.Unmarshal(mustField(t, rr, "result"), &out))
+	require.Len(t, out.Content, 1)
+	link, ok := out.Content[0].(*mcp.ResourceLink)
+	require.True(t, ok)
+	require.Equal(t, downstreamResourceURI("file:///data", "backend2"), link.URI)
+}
+
+func TestHandleModernToolsCall_NeverModeBareName(t *testing.T) {
+	// A bare tool name is resolved through the static neverModeToolIndex and the
+	// bare name is forwarded to the owning backend unchanged.
+	var gotName, gotBackend string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBackend = r.Header.Get(internalapi.MCPBackendHeader)
+		body, _ := io.ReadAll(r.Body)
+		var env struct {
+			ID     json.RawMessage `json:"id"`
+			Params struct {
+				Name string `json:"name"`
+			} `json:"params"`
+		}
+		require.NoError(t, json.Unmarshal(body, &env))
+		gotName = env.Params.Name
+		resp := fmt.Appendf(nil, `{"jsonrpc":"2.0","id":%s,"result":{}}`, env.ID)
+		_, _ = w.Write(resp)
+	}))
+	defer server.Close()
+
+	proxy := newTestMCPProxy()
+	proxy.backendListenerAddr = server.URL
+	proxy.routes["test-route"].neverModeToolIndex = map[string]string{"search": "backend1"}
+	// Allow the bare name through backend1's selector.
+	proxy.routes["test-route"].toolSelectors["backend1"] = &toolSelector{include: map[string]struct{}{"search": {}}}
+
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "tools/call", []byte(`{"name":"search"}`))
+	_, err := proxy.handleModernToolsCall(context.Background(), rr, newModernRequest("tools/call"), req, "test-route", nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	require.Equal(t, "backend1", gotBackend)
+	require.Equal(t, "search", gotName)
+}
+
+func TestHandleModernToolsCall_ToolSelectorDenied(t *testing.T) {
+	proxy := newTestMCPProxy()
+	// backend1 selector only allows "test-tool"; "blocked" must be rejected.
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "tools/call", fmt.Appendf(nil, `{"name":%q}`, downstreamResourceName("blocked", "backend1")))
+	_, err := proxy.handleModernToolsCall(context.Background(), rr, newModernRequest("tools/call"), req, "test-route", nil)
+	require.ErrorIs(t, err, errInvalidToolName)
+	require.Equal(t, http.StatusBadRequest, rr.Code)
+}
+
+func TestHandleModernToolsCall_InvalidName(t *testing.T) {
+	proxy := newTestMCPProxy()
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "tools/call", []byte(`{"name":"no-prefix"}`))
+	_, err := proxy.handleModernToolsCall(context.Background(), rr, newModernRequest("tools/call"), req, "test-route", nil)
+	require.ErrorIs(t, err, errInvalidToolName)
+	require.Equal(t, http.StatusBadRequest, rr.Code)
+}
+
+func TestHandleModernToolsCall_UnknownBackend(t *testing.T) {
+	proxy := newTestMCPProxy()
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "tools/call", fmt.Appendf(nil, `{"name":%q}`, downstreamResourceName("do-it", "nope")))
+	_, err := proxy.handleModernToolsCall(context.Background(), rr, newModernRequest("tools/call"), req, "test-route", nil)
+	require.ErrorIs(t, err, errBackendNotFound)
+	require.Equal(t, http.StatusNotFound, rr.Code)
+}
+
+func TestHandleModernResourcesRead_RePrefixesContentURIs(t *testing.T) {
+	respFn := func(_, _ string) any {
+		return mcp.ReadResourceResult{
+			Contents: []*mcp.ResourceContents{{URI: "file:///cfg", Text: "hello"}},
+		}
+	}
+	server := httptest.NewServer(modernBackendHandler(t, nil, nil, respFn))
+	defer server.Close()
+
+	proxy := newTestMCPProxy()
+	proxy.backendListenerAddr = server.URL
+
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "resources/read", fmt.Appendf(nil, `{"uri":%q}`, downstreamResourceURI("file:///cfg", "backend2")))
+	_, err := proxy.handleModernResourcesRead(context.Background(), rr, newModernRequest("resources/read"), req, "test-route", nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	result := decodeResult(t, rr)
+	var contents []map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(result["contents"], &contents))
+	require.Len(t, contents, 1)
+	var uri string
+	require.NoError(t, json.Unmarshal(contents[0]["uri"], &uri))
+	require.Equal(t, downstreamResourceURI("file:///cfg", "backend2"), uri)
+	// resources/read MUST carry caching hints on complete results
+	// (https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/caching#cacheable-results).
+	// When the backend omits them the gateway defaults to ttlMs=0 (immediately
+	// stale) and cacheScope="private" (caller-specific content).
+	require.Equal(t, "0", string(result["ttlMs"]))
+	require.Equal(t, `"private"`, string(result["cacheScope"]))
+}
+
+func TestRewriteResourcesReadResult_CachingHints(t *testing.T) {
+	t.Run("injects defaults when backend omits hints", func(t *testing.T) {
+		in := []byte(`{"contents":[{"uri":"file:///a","text":"x"}]}`)
+		out, ok := rewriteResourcesReadResult(in, "backend1")
+		require.True(t, ok)
+
+		var m map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(out, &m))
+		require.Equal(t, "0", string(m["ttlMs"]))
+		require.Equal(t, `"private"`, string(m["cacheScope"]))
+		var contents []map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(m["contents"], &contents))
+		var uri string
+		require.NoError(t, json.Unmarshal(contents[0]["uri"], &uri))
+		require.Equal(t, downstreamResourceURI("file:///a", "backend1"), uri)
+	})
+
+	t.Run("preserves backend-provided hints", func(t *testing.T) {
+		in := []byte(`{"contents":[{"uri":"file:///a","text":"x"}],"ttlMs":60000,"cacheScope":"public"}`)
+		out, ok := rewriteResourcesReadResult(in, "backend1")
+		require.True(t, ok)
+
+		var m map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(out, &m))
+		require.Equal(t, "60000", string(m["ttlMs"]))
+		require.Equal(t, `"public"`, string(m["cacheScope"]))
+	})
+
+	t.Run("replaces empty cacheScope from zero-value Cacheable", func(t *testing.T) {
+		// mcp.ReadResourceResult embeds Cacheable without omitempty, so a backend
+		// that never sets hints still serializes cacheScope as "".
+		in := []byte(`{"contents":[{"uri":"file:///a","text":"x"}],"ttlMs":0,"cacheScope":""}`)
+		out, ok := rewriteResourcesReadResult(in, "backend1")
+		require.True(t, ok)
+
+		var m map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(out, &m))
+		require.Equal(t, "0", string(m["ttlMs"]))
+		require.Equal(t, `"private"`, string(m["cacheScope"]))
+	})
+
+	t.Run("skips interim input_required results", func(t *testing.T) {
+		in := []byte(`{"resultType":"input_required","inputRequests":{"q":{"type":"text"}}}`)
+		out, ok := rewriteResourcesReadResult(in, "backend1")
+		require.False(t, ok)
+		require.Nil(t, out)
+	})
+}
+
+func TestHandleModernResourcesRead_InvalidURI(t *testing.T) {
+	proxy := newTestMCPProxy()
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "resources/read", []byte(`{"uri":"file:///no-backend"}`))
+	_, err := proxy.handleModernResourcesRead(context.Background(), rr, newModernRequest("resources/read"), req, "test-route", nil)
+	require.Error(t, err)
+	require.Equal(t, http.StatusBadRequest, rr.Code)
+}
+
+func TestHandleModernPromptsGet_PromptSelectorDenied(t *testing.T) {
+	proxy := newTestMCPProxy()
+	proxy.routes["test-route"].promptSelectors = map[filterapi.MCPBackendName]*toolSelector{
+		"backend1": {include: map[string]struct{}{"allowed": {}}},
+	}
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "prompts/get", fmt.Appendf(nil, `{"name":%q}`, downstreamResourceName("blocked", "backend1")))
+	_, err := proxy.handleModernPromptsGet(context.Background(), rr, newModernRequest("prompts/get"), req, "test-route", nil)
+	require.ErrorIs(t, err, errInvalidToolName)
+	require.Equal(t, http.StatusBadRequest, rr.Code)
+}
+
+func TestHandleModernComplete_RefResource(t *testing.T) {
+	var gotURI, gotBackend string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBackend = r.Header.Get(internalapi.MCPBackendHeader)
+		body, _ := io.ReadAll(r.Body)
+		var env struct {
+			ID     json.RawMessage `json:"id"`
+			Params struct {
+				Ref struct {
+					URI string `json:"uri"`
+				} `json:"ref"`
+			} `json:"params"`
+		}
+		require.NoError(t, json.Unmarshal(body, &env))
+		gotURI = env.Params.Ref.URI
+		resp := fmt.Appendf(nil, `{"jsonrpc":"2.0","id":%s,"result":{}}`, env.ID)
+		_, _ = w.Write(resp)
+	}))
+	defer server.Close()
+
+	proxy := newTestMCPProxy()
+	proxy.backendListenerAddr = server.URL
+
+	rr := httptest.NewRecorder()
+	params := fmt.Appendf(nil, `{"ref":{"type":"ref/resource","uri":%q},"argument":{"name":"a","value":"v"}}`,
+		downstreamResourceURI("file:///doc", "backend2"))
+	req := modernReq(t, "completion/complete", params)
+	_, err := proxy.handleModernComplete(context.Background(), rr, newModernRequest("completion/complete"), req, "test-route", nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	require.Equal(t, "backend2", gotBackend)
+	require.Equal(t, "file:///doc", gotURI)
+}
+
+func TestHandleModernComplete_UnsupportedRefType(t *testing.T) {
+	proxy := newTestMCPProxy()
+	rr := httptest.NewRecorder()
+	// The SDK rejects unknown ref types at unmarshal time, so a missing ref
+	// exercises the handler's own validation path.
+	req := modernReq(t, "completion/complete", []byte(`{"argument":{"name":"a","value":"v"}}`))
+	_, err := proxy.handleModernComplete(context.Background(), rr, newModernRequest("completion/complete"), req, "test-route", nil)
+	require.Error(t, err)
+	require.Equal(t, http.StatusBadRequest, rr.Code)
+}
+
+func TestHandleModernComplete_RouteNotFound(t *testing.T) {
+	proxy := newTestMCPProxy()
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "completion/complete", []byte(`{"ref":{"type":"ref/prompt","name":"backend1__x"},"argument":{"name":"a","value":"v"}}`))
+	_, err := proxy.handleModernComplete(context.Background(), rr, newModernRequest("completion/complete"), req, "nope", nil)
+	require.ErrorIs(t, err, errBackendNotFound)
+	require.Equal(t, http.StatusNotFound, rr.Code)
+}
+
+func TestHandleSubscriptionsListen_MergesAndRewritesEvents(t *testing.T) {
+	// Each backend emits one resources/updated notification with an upstream URI;
+	// the gateway must re-prefix each URI into the downstream namespace and forward
+	// all events to the single client SSE stream.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backend := r.Header.Get(internalapi.MCPBackendHeader)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		notif := fmt.Sprintf(`{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"file:///watched-%s"}}`, backend)
+		_, _ = w.Write([]byte("event: message\ndata: " + notif + "\n\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer server.Close()
+
+	proxy := newTestMCPProxy()
+	proxy.backendListenerAddr = server.URL
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	r := newModernRequest("subscriptions/listen").WithContext(ctx)
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "subscriptions/listen", []byte(`{"notifications":{"resourceSubscriptions":["file:///watched-backend1"]}}`))
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = proxy.handleSubscriptionsListen(ctx, rr, r, req, "test-route", nil)
+		close(done)
+	}()
+
+	// Give the backends time to emit their events, then cancel to unblock the merge loop.
+	require.Eventually(t, func() bool {
+		body := rr.Body.String()
+		return strings.Contains(body, downstreamResourceURI("file:///watched-backend1", "backend1")) &&
+			strings.Contains(body, downstreamResourceURI("file:///watched-backend2", "backend2"))
+	}, time.Second, 10*time.Millisecond)
+	cancel()
+	<-done
+
+	require.True(t, proxy.perBackendMetricsRecorded)
+	require.Equal(t, "text/event-stream", rr.Header().Get("Content-Type"))
+}
+
+// cmpOr returns the first non-empty string, a tiny local helper for tests.
+func cmpOr(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// mustField returns the raw JSON of a top-level field from a recorded JSON-RPC response.
+func mustField(t *testing.T, rr *httptest.ResponseRecorder, field string) json.RawMessage {
+	t.Helper()
+	var envelope map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &envelope))
+	require.Contains(t, envelope, field)
+	return envelope[field]
 }
 
 // -----------------------------------------------------------------------------
