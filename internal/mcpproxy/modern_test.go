@@ -1890,3 +1890,573 @@ func TestWriteJSONRPCResult(t *testing.T) {
 	require.NoError(t, json.Unmarshal(envelope["result"], &result))
 	require.Equal(t, `"complete"`, string(result["resultType"]))
 }
+
+// -----------------------------------------------------------------------------
+// tools/call authorization (per-route CEL/scope enforcement, parity with legacy)
+// -----------------------------------------------------------------------------
+
+// mustCompileAuthorization compiles an MCPRouteAuthorization for use as a
+// route-level authorization policy in tests.
+func mustCompileAuthorization(t *testing.T, auth *filterapi.MCPRouteAuthorization) *compiledAuthorization {
+	t.Helper()
+	compiled, err := compileAuthorization(auth)
+	require.NoError(t, err)
+	return compiled
+}
+
+// TestHandleModernToolsCall_AuthorizationDenied covers the per-route
+// authorization branch of handleModernToolsCall: a request that fails the CEL
+// policy is rejected with 403 and never reaches the backend.
+func TestHandleModernToolsCall_AuthorizationDenied(t *testing.T) {
+	var backendCalled bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		backendCalled = true
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"1","result":{}}`))
+	}))
+	defer server.Close()
+
+	proxy := newTestMCPProxy()
+	proxy.backendListenerAddr = server.URL
+	// backend2 has no static tool selector, so only the authorization policy governs access.
+	proxy.routes["test-route"].authorization = mustCompileAuthorization(t, &filterapi.MCPRouteAuthorization{
+		DefaultAction: filterapi.AuthorizationActionDeny,
+	})
+
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "tools/call", fmt.Appendf(nil, `{"name":%q}`, downstreamResourceName("do-it", "backend2")))
+	_, err := proxy.handleModernToolsCall(context.Background(), rr, newModernRequest("tools/call"), req, "test-route", nil)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "authorization failed")
+	require.Equal(t, http.StatusForbidden, rr.Code)
+	require.Equal(t, "access denied", rr.Body.String())
+	require.False(t, backendCalled, "backend must not be called when authorization is denied")
+}
+
+// TestHandleModernToolsCall_AuthorizationScopeChallenge covers the scope
+// challenge branch: an Allow rule requires scopes the caller lacks, so the
+// gateway denies with 403 and emits a WWW-Authenticate challenge header
+// pointing at the route's resource metadata URL (parity with the legacy path).
+func TestHandleModernToolsCall_AuthorizationScopeChallenge(t *testing.T) {
+	const resourceMetadata = "https://api.example.com/.well-known/oauth-protected-resource/mcp"
+
+	proxy := newTestMCPProxy()
+	proxy.backendListenerAddr = "http://unused"
+	proxy.routes["test-route"].authorization = mustCompileAuthorization(t, &filterapi.MCPRouteAuthorization{
+		DefaultAction:       filterapi.AuthorizationActionDeny,
+		ResourceMetadataURL: resourceMetadata,
+		Rules: []filterapi.MCPRouteAuthorizationRule{
+			{
+				Action: filterapi.AuthorizationActionAllow,
+				Source: &filterapi.MCPAuthorizationSource{
+					JWT: filterapi.JWTSource{Scopes: []string{"read", "write"}},
+				},
+				Target: &filterapi.MCPAuthorizationTarget{
+					Tools: []filterapi.ToolCall{{Backend: "backend2", Tool: "do-it"}},
+				},
+			},
+		},
+	})
+
+	// Caller only presents the "read" scope, so the "read write" rule is not satisfied.
+	r := newModernRequest("tools/call")
+	r.Header.Set("Authorization", "Bearer "+bearerTokenWithClaims(jwt.MapClaims{"scope": []string{"read"}}))
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "tools/call", fmt.Appendf(nil, `{"name":%q}`, downstreamResourceName("do-it", "backend2")))
+
+	_, err := proxy.handleModernToolsCall(context.Background(), rr, r, req, "test-route", nil)
+
+	require.Error(t, err)
+	require.Equal(t, http.StatusForbidden, rr.Code)
+	challenge := rr.Header().Get("WWW-Authenticate")
+	require.Contains(t, challenge, "insufficient_scope")
+	require.Contains(t, challenge, "scope=\"read write\"")
+	require.Contains(t, challenge, resourceMetadata)
+}
+
+// TestHandleModernToolsCall_AuthorizationAllowed covers the happy path through
+// the authorization branch: a caller with the required scope is allowed and the
+// request reaches the backend with the unprefixed tool name.
+func TestHandleModernToolsCall_AuthorizationAllowed(t *testing.T) {
+	var gotName string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var env struct {
+			ID     json.RawMessage `json:"id"`
+			Params struct {
+				Name string `json:"name"`
+			} `json:"params"`
+		}
+		require.NoError(t, json.Unmarshal(body, &env))
+		gotName = env.Params.Name
+		resp := fmt.Appendf(nil, `{"jsonrpc":"2.0","id":%s,"result":{}}`, env.ID)
+		_, _ = w.Write(resp)
+	}))
+	defer server.Close()
+
+	proxy := newTestMCPProxy()
+	proxy.backendListenerAddr = server.URL
+	proxy.routes["test-route"].authorization = mustCompileAuthorization(t, &filterapi.MCPRouteAuthorization{
+		DefaultAction: filterapi.AuthorizationActionDeny,
+		Rules: []filterapi.MCPRouteAuthorizationRule{
+			{
+				Action: filterapi.AuthorizationActionAllow,
+				Source: &filterapi.MCPAuthorizationSource{
+					JWT: filterapi.JWTSource{Scopes: []string{"read"}},
+				},
+				Target: &filterapi.MCPAuthorizationTarget{
+					Tools: []filterapi.ToolCall{{Backend: "backend2", Tool: "do-it"}},
+				},
+			},
+		},
+	})
+
+	r := newModernRequest("tools/call")
+	r.Header.Set("Authorization", "Bearer "+bearerTokenWithClaims(jwt.MapClaims{"scope": []string{"read"}}))
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "tools/call", fmt.Appendf(nil, `{"name":%q}`, downstreamResourceName("do-it", "backend2")))
+
+	_, err := proxy.handleModernToolsCall(context.Background(), rr, r, req, "test-route", nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	require.Equal(t, "do-it", gotName, "backend must receive the unprefixed tool name")
+}
+
+// -----------------------------------------------------------------------------
+// lookupSelectedBackend: backendSelector excludes a route backend (403 vs 404)
+// -----------------------------------------------------------------------------
+
+// TestHandleModernToolsCall_BackendExcludedBySelector covers the 403 branch of
+// lookupSelectedBackend: the target backend is on the route but was filtered out
+// by backendSelector for this caller, which is an authorization decision (403),
+// not an unknown-backend error (404).
+func TestHandleModernToolsCall_BackendExcludedBySelector(t *testing.T) {
+	proxy := newTestMCPProxy()
+	proxy.backendListenerAddr = "http://unused"
+	proxy.routes["test-route"].backendSelector = jwtBackendSelectorAllowing(t)
+
+	// Caller is only authorized for backend2, but targets backend1 (on the route).
+	r := newModernRequest("tools/call")
+	r.Header.Set("Authorization", "Bearer "+bearerTokenWithClaims(jwt.MapClaims{"mcp_backends": []string{"backend2"}}))
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "tools/call", fmt.Appendf(nil, `{"name":%q}`, downstreamResourceName("do-it", "backend1")))
+
+	_, err := proxy.handleModernToolsCall(context.Background(), rr, r, req, "test-route", nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "authorization failed")
+	require.Equal(t, http.StatusForbidden, rr.Code)
+	require.Equal(t, "access denied", rr.Body.String())
+}
+
+// -----------------------------------------------------------------------------
+// rewriteToolsCallResult: MRTR / non-standard passthrough
+// -----------------------------------------------------------------------------
+
+func TestRewriteToolsCallResult(t *testing.T) {
+	l := slog.Default()
+
+	t.Run("input_required passes through verbatim", func(t *testing.T) {
+		// Interim MRTR results must not be rewritten so the state survives.
+		in := json.RawMessage(`{"resultType":"input_required","inputRequests":{"q":{"type":"text"}}}`)
+		out, ok := rewriteToolsCallResult(in, "backend1", l)
+		require.False(t, ok)
+		require.Nil(t, out)
+	})
+
+	t.Run("inputRequests without resultType passes through", func(t *testing.T) {
+		in := json.RawMessage(`{"inputRequests":{"q":{"type":"text"}}}`)
+		out, ok := rewriteToolsCallResult(in, "backend1", l)
+		require.False(t, ok)
+		require.Nil(t, out)
+	})
+
+	t.Run("non-standard result shape passes through", func(t *testing.T) {
+		// A result that does not unmarshal into a CallToolResult is owned by the
+		// backend and must pass through unchanged.
+		in := json.RawMessage(`{"content":"not-an-array"}`)
+		out, ok := rewriteToolsCallResult(in, "backend1", l)
+		require.False(t, ok)
+		require.Nil(t, out)
+	})
+
+	t.Run("result with no URIs is left untouched", func(t *testing.T) {
+		in := json.RawMessage(`{"content":[{"type":"text","text":"hi"}]}`)
+		out, ok := rewriteToolsCallResult(in, "backend1", l)
+		require.False(t, ok, "no URIs to rewrite")
+		require.Nil(t, out)
+	})
+
+	t.Run("complete result with resource link is re-prefixed", func(t *testing.T) {
+		link, err := json.Marshal(mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.ResourceLink{URI: "file:///data"}},
+		})
+		require.NoError(t, err)
+		out, ok := rewriteToolsCallResult(link, "backend1", l)
+		require.True(t, ok)
+
+		var result mcp.CallToolResult
+		require.NoError(t, json.Unmarshal(out, &result))
+		require.Len(t, result.Content, 1)
+		rl, isLink := result.Content[0].(*mcp.ResourceLink)
+		require.True(t, isLink)
+		require.Equal(t, downstreamResourceURI("file:///data", "backend1"), rl.URI)
+	})
+}
+
+// TestHandleModernToolsCall_InputRequiredPassthrough drives the full handler
+// with a backend that returns an interim MRTR result: the gateway must forward
+// the input_required result verbatim (no URI rewrite, no resultType override).
+func TestHandleModernToolsCall_InputRequiredPassthrough(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var env struct {
+			ID json.RawMessage `json:"id"`
+		}
+		require.NoError(t, json.Unmarshal(body, &env))
+		resp := fmt.Appendf(nil,
+			`{"jsonrpc":"2.0","id":%s,"result":{"resultType":"input_required","inputRequests":{"q":{"type":"text"}}}}`,
+			env.ID)
+		_, _ = w.Write(resp)
+	}))
+	defer server.Close()
+
+	proxy := newTestMCPProxy()
+	proxy.backendListenerAddr = server.URL
+
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "tools/call", fmt.Appendf(nil, `{"name":%q}`, downstreamResourceName("do-it", "backend2")))
+	_, err := proxy.handleModernToolsCall(context.Background(), rr, newModernRequest("tools/call"), req, "test-route", nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	result := decodeResult(t, rr)
+	require.Equal(t, `"input_required"`, string(result["resultType"]),
+		"interim MRTR resultType must be preserved, not overridden to complete")
+	require.Contains(t, result, "inputRequests")
+}
+
+// -----------------------------------------------------------------------------
+// list fan-out: all backends fail surfaces a 500 for each list method
+// -----------------------------------------------------------------------------
+
+func TestHandleModernList_AllBackendsFail(t *testing.T) {
+	server := httptest.NewServer(modernBackendHandler(t, nil,
+		map[string]bool{"backend1": true, "backend2": true}, func(_, _ string) any { return map[string]any{} }))
+	defer server.Close()
+
+	tests := []struct {
+		method  string
+		handler func(*mcpRequestContext, *httptest.ResponseRecorder, *jsonrpc.Request) (handlerResult, error)
+	}{
+		{
+			method: "resources/list",
+			handler: func(p *mcpRequestContext, rr *httptest.ResponseRecorder, req *jsonrpc.Request) (handlerResult, error) {
+				return p.handleModernResourcesList(context.Background(), rr, newModernRequest("resources/list"), req, "test-route", nil)
+			},
+		},
+		{
+			method: "resources/templates/list",
+			handler: func(p *mcpRequestContext, rr *httptest.ResponseRecorder, req *jsonrpc.Request) (handlerResult, error) {
+				return p.handleModernResourceTemplatesList(context.Background(), rr, newModernRequest("resources/templates/list"), req, "test-route", nil)
+			},
+		},
+		{
+			method: "prompts/list",
+			handler: func(p *mcpRequestContext, rr *httptest.ResponseRecorder, req *jsonrpc.Request) (handlerResult, error) {
+				return p.handleModernPromptsList(context.Background(), rr, newModernRequest("prompts/list"), req, "test-route", nil)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.method, func(t *testing.T) {
+			proxy := newTestMCPProxy()
+			proxy.backendListenerAddr = server.URL
+			delete(proxy.routes["test-route"].toolSelectors, "backend1")
+
+			rr := httptest.NewRecorder()
+			req := modernReq(t, tc.method, nil)
+			_, err := tc.handler(proxy, rr, req)
+			require.ErrorIs(t, err, errModernListNoBackends)
+			require.Equal(t, http.StatusInternalServerError, rr.Code)
+		})
+	}
+}
+
+// -----------------------------------------------------------------------------
+// prompts/get: never-mode bare prompt names resolve via neverModePromptIndex
+// -----------------------------------------------------------------------------
+
+func TestHandleModernPromptsGet_NeverModeBareName(t *testing.T) {
+	var gotName, gotBackend string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBackend = r.Header.Get(internalapi.MCPBackendHeader)
+		body, _ := io.ReadAll(r.Body)
+		var env struct {
+			ID     json.RawMessage `json:"id"`
+			Params struct {
+				Name string `json:"name"`
+			} `json:"params"`
+		}
+		require.NoError(t, json.Unmarshal(body, &env))
+		gotName = env.Params.Name
+		resp := fmt.Appendf(nil, `{"jsonrpc":"2.0","id":%s,"result":{}}`, env.ID)
+		_, _ = w.Write(resp)
+	}))
+	defer server.Close()
+
+	proxy := newTestMCPProxy()
+	proxy.backendListenerAddr = server.URL
+	proxy.routes["test-route"].neverModePromptIndex = map[string]string{"greeting": "backend1"}
+
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "prompts/get", []byte(`{"name":"greeting"}`))
+	_, err := proxy.handleModernPromptsGet(context.Background(), rr, newModernRequest("prompts/get"), req, "test-route", nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	require.Equal(t, "backend1", gotBackend)
+	require.Equal(t, "greeting", gotName, "backend must receive the bare (unprefixed) prompt name")
+}
+
+func TestHandleModernPromptsGet_InvalidName(t *testing.T) {
+	proxy := newTestMCPProxy()
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "prompts/get", []byte(`{"name":"no-prefix"}`))
+	_, err := proxy.handleModernPromptsGet(context.Background(), rr, newModernRequest("prompts/get"), req, "test-route", nil)
+	require.ErrorIs(t, err, errInvalidToolName)
+	require.Equal(t, http.StatusBadRequest, rr.Code)
+}
+
+// -----------------------------------------------------------------------------
+// sendModernRequestAndProxy: backend failure surfaces a 500 to the client
+// -----------------------------------------------------------------------------
+
+func TestSendModernRequestAndProxy_BackendFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("upstream boom"))
+	}))
+	defer server.Close()
+
+	proxy := newTestMCPProxy()
+	proxy.backendListenerAddr = server.URL
+	proxy.requestHeaders = http.Header{}
+
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "tools/call", []byte(`{"name":"do-it"}`))
+	backend := proxy.routes["test-route"].backends["backend1"]
+	_, err := proxy.sendModernRequestAndProxy(context.Background(), rr, req, "test-route", backend, handlerResult{}, nil, nil)
+
+	require.Error(t, err)
+	require.Equal(t, http.StatusInternalServerError, rr.Code)
+	require.Contains(t, rr.Body.String(), "call to backend1 failed")
+}
+
+// -----------------------------------------------------------------------------
+// rewriteUpdatedURI: subscription notification URI re-prefixing edge cases
+// -----------------------------------------------------------------------------
+
+func TestRewriteUpdatedURI(t *testing.T) {
+	t.Run("re-prefixes uri", func(t *testing.T) {
+		out, ok := rewriteUpdatedURI(json.RawMessage(`{"uri":"file:///watched"}`), "backend1")
+		require.True(t, ok)
+		var m map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(out, &m))
+		var uri string
+		require.NoError(t, json.Unmarshal(m["uri"], &uri))
+		require.Equal(t, downstreamResourceURI("file:///watched", "backend1"), uri)
+	})
+
+	t.Run("empty params", func(t *testing.T) {
+		out, ok := rewriteUpdatedURI(nil, "backend1")
+		require.False(t, ok)
+		require.Nil(t, out)
+	})
+
+	t.Run("invalid json", func(t *testing.T) {
+		out, ok := rewriteUpdatedURI(json.RawMessage(`not-json`), "backend1")
+		require.False(t, ok)
+		require.Nil(t, out)
+	})
+
+	t.Run("missing uri field", func(t *testing.T) {
+		out, ok := rewriteUpdatedURI(json.RawMessage(`{"other":"x"}`), "backend1")
+		require.False(t, ok)
+		require.Nil(t, out)
+	})
+
+	t.Run("empty uri value", func(t *testing.T) {
+		out, ok := rewriteUpdatedURI(json.RawMessage(`{"uri":""}`), "backend1")
+		require.False(t, ok)
+		require.Nil(t, out)
+	})
+}
+
+// -----------------------------------------------------------------------------
+// serveModernPOST: invalid params are rejected (400) before dispatch for every
+// span-starting method, and no span is opened.
+// -----------------------------------------------------------------------------
+
+func TestServeModernPOST_InvalidParamsPerMethod(t *testing.T) {
+	// A non-object params value fails to unmarshal into each method's typed
+	// params struct, exercising the invalid-params branch of every dispatch case.
+	methods := []string{
+		"server/discover",
+		"tools/list",
+		"resources/list",
+		"resources/templates/list",
+		"prompts/list",
+		"tools/call",
+		"resources/read",
+		"prompts/get",
+		"subscriptions/listen",
+		"completion/complete",
+	}
+	for _, method := range methods {
+		t.Run(method, func(t *testing.T) {
+			tracer := &fakeTracer{}
+			proxy := newTestMCPProxyWithTracer(tracer)
+			r := newModernRequest(method)
+			rr := httptest.NewRecorder()
+			req := modernReq(t, method, []byte(`"not-an-object"`))
+
+			proxy.serveModernPOST(rr, r, req, time.Now())
+
+			require.Equal(t, http.StatusBadRequest, rr.Code)
+			require.Contains(t, rr.Body.String(), "invalid params")
+			require.Equal(t, 0, tracer.starts, "no span should be started for invalid params")
+		})
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Single-target handlers: route-not-found (404) parity across methods.
+// -----------------------------------------------------------------------------
+
+func TestHandleModernSingleTarget_RouteNotFound(t *testing.T) {
+	tests := []struct {
+		method  string
+		params  []byte
+		handler func(*mcpRequestContext, *httptest.ResponseRecorder, *jsonrpc.Request) (handlerResult, error)
+	}{
+		{
+			method: "tools/call",
+			params: fmt.Appendf(nil, `{"name":%q}`, downstreamResourceName("do-it", "backend2")),
+			handler: func(p *mcpRequestContext, rr *httptest.ResponseRecorder, req *jsonrpc.Request) (handlerResult, error) {
+				return p.handleModernToolsCall(context.Background(), rr, newModernRequest("tools/call"), req, "nope", nil)
+			},
+		},
+		{
+			method: "resources/read",
+			params: fmt.Appendf(nil, `{"uri":%q}`, downstreamResourceURI("file:///cfg", "backend2")),
+			handler: func(p *mcpRequestContext, rr *httptest.ResponseRecorder, req *jsonrpc.Request) (handlerResult, error) {
+				return p.handleModernResourcesRead(context.Background(), rr, newModernRequest("resources/read"), req, "nope", nil)
+			},
+		},
+		{
+			method: "prompts/get",
+			params: fmt.Appendf(nil, `{"name":%q}`, downstreamResourceName("greet", "backend2")),
+			handler: func(p *mcpRequestContext, rr *httptest.ResponseRecorder, req *jsonrpc.Request) (handlerResult, error) {
+				return p.handleModernPromptsGet(context.Background(), rr, newModernRequest("prompts/get"), req, "nope", nil)
+			},
+		},
+		{
+			method: "subscriptions/listen",
+			params: []byte(`{}`),
+			handler: func(p *mcpRequestContext, rr *httptest.ResponseRecorder, req *jsonrpc.Request) (handlerResult, error) {
+				return p.handleSubscriptionsListen(context.Background(), rr, newModernRequest("subscriptions/listen"), req, "nope", nil)
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.method, func(t *testing.T) {
+			proxy := newTestMCPProxy()
+			rr := httptest.NewRecorder()
+			req := modernReq(t, tc.method, tc.params)
+			_, err := tc.handler(proxy, rr, req)
+			require.ErrorIs(t, err, errBackendNotFound)
+			require.Equal(t, http.StatusNotFound, rr.Code)
+		})
+	}
+}
+
+// -----------------------------------------------------------------------------
+// resources/read and prompts/get and completion/complete: unknown backend (404)
+// and invalid params (400) branches.
+// -----------------------------------------------------------------------------
+
+func TestHandleModernResourcesRead_UnknownBackend(t *testing.T) {
+	proxy := newTestMCPProxy()
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "resources/read", fmt.Appendf(nil, `{"uri":%q}`, downstreamResourceURI("file:///cfg", "nope")))
+	_, err := proxy.handleModernResourcesRead(context.Background(), rr, newModernRequest("resources/read"), req, "test-route", nil)
+	require.ErrorIs(t, err, errBackendNotFound)
+	require.Equal(t, http.StatusNotFound, rr.Code)
+}
+
+func TestHandleModernPromptsGet_UnknownBackend(t *testing.T) {
+	proxy := newTestMCPProxy()
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "prompts/get", fmt.Appendf(nil, `{"name":%q}`, downstreamResourceName("greet", "nope")))
+	_, err := proxy.handleModernPromptsGet(context.Background(), rr, newModernRequest("prompts/get"), req, "test-route", nil)
+	require.ErrorIs(t, err, errBackendNotFound)
+	require.Equal(t, http.StatusNotFound, rr.Code)
+}
+
+func TestHandleModernComplete_UnknownBackend(t *testing.T) {
+	proxy := newTestMCPProxy()
+	rr := httptest.NewRecorder()
+	params := fmt.Appendf(nil, `{"ref":{"type":"ref/resource","uri":%q},"argument":{"name":"a","value":"v"}}`,
+		downstreamResourceURI("file:///doc", "nope"))
+	req := modernReq(t, "completion/complete", params)
+	_, err := proxy.handleModernComplete(context.Background(), rr, newModernRequest("completion/complete"), req, "test-route", nil)
+	require.ErrorIs(t, err, errBackendNotFound)
+	require.Equal(t, http.StatusNotFound, rr.Code)
+}
+
+func TestHandleModernComplete_InvalidRefName(t *testing.T) {
+	// A ref/prompt name without a backend prefix fails resolvePromptBackend.
+	proxy := newTestMCPProxy()
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "completion/complete", []byte(`{"ref":{"type":"ref/prompt","name":"no-prefix"},"argument":{"name":"a","value":"v"}}`))
+	_, err := proxy.handleModernComplete(context.Background(), rr, newModernRequest("completion/complete"), req, "test-route", nil)
+	require.Error(t, err)
+	require.Equal(t, http.StatusBadRequest, rr.Code)
+}
+
+// -----------------------------------------------------------------------------
+// prompts/get: happy path re-prefixes nothing on the wire but returns complete.
+// -----------------------------------------------------------------------------
+
+func TestHandleModernPromptsGet_ForwardsUnprefixedName(t *testing.T) {
+	var gotName, gotBackend string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBackend = r.Header.Get(internalapi.MCPBackendHeader)
+		body, _ := io.ReadAll(r.Body)
+		var env struct {
+			ID     json.RawMessage `json:"id"`
+			Params struct {
+				Name string `json:"name"`
+			} `json:"params"`
+		}
+		require.NoError(t, json.Unmarshal(body, &env))
+		gotName = env.Params.Name
+		resp := fmt.Appendf(nil, `{"jsonrpc":"2.0","id":%s,"result":{}}`, env.ID)
+		_, _ = w.Write(resp)
+	}))
+	defer server.Close()
+
+	proxy := newTestMCPProxy()
+	proxy.backendListenerAddr = server.URL
+
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "prompts/get", fmt.Appendf(nil, `{"name":%q}`, downstreamResourceName("greet", "backend2")))
+	_, err := proxy.handleModernPromptsGet(context.Background(), rr, newModernRequest("prompts/get"), req, "test-route", nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	require.Equal(t, "backend2", gotBackend)
+	require.Equal(t, "greet", gotName)
+
+	result := decodeResult(t, rr)
+	require.Equal(t, `"complete"`, string(result["resultType"]))
+}
