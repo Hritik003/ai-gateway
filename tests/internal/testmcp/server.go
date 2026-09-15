@@ -8,8 +8,10 @@ package testmcp
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -250,14 +252,27 @@ func newDumbServer(port int) (*http.Server, *mcp.Server) {
 // (2026-07-28) requests — notably server/discover from go-sdk v1.7+ Connect —
 // are rejected. That forces the client to fall back to the initialize handshake,
 // keeping dataplane legacy tests on the legacy path.
+//
+// The JSON-RPC error MUST echo the request id. A null id makes go-sdk treat the
+// response as invalid and close the connection, so Connect never reaches
+// initialize (breaks BenchmarkMCP/Baseline_NoProxy).
 func rejectModernProtocol(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		version := r.Header.Get("Mcp-Protocol-Version")
 		method := r.Header.Get("Mcp-Method")
 		if version == "2026-07-28" || method == "server/discover" {
+			id := json.RawMessage("null")
+			if body, err := io.ReadAll(r.Body); err == nil {
+				var req struct {
+					ID json.RawMessage `json:"id"`
+				}
+				if json.Unmarshal(body, &req) == nil && len(req.ID) > 0 {
+					id = req.ID
+				}
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32601,"message":"Method not found: server/discover"}}`))
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found: server/discover"}}`, id)
 			return
 		}
 		next.ServeHTTP(w, r)
