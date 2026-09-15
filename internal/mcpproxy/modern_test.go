@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1347,6 +1348,38 @@ func TestHandleModernComplete_RouteNotFound(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, rr.Code)
 }
 
+// concurrentRecorder is a ResponseRecorder safe for concurrent Write (handler
+// goroutine) and Body reads (Eventually polling). httptest.ResponseRecorder is
+// not concurrency-safe; reading Body while the handler writes races under -race.
+type concurrentRecorder struct {
+	*httptest.ResponseRecorder
+	mu sync.Mutex
+}
+
+func (r *concurrentRecorder) Header() http.Header {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.ResponseRecorder.Header()
+}
+
+func (r *concurrentRecorder) Write(b []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.ResponseRecorder.Write(b)
+}
+
+func (r *concurrentRecorder) WriteHeader(statusCode int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ResponseRecorder.WriteHeader(statusCode)
+}
+
+func (r *concurrentRecorder) bodyString() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.Body.String()
+}
+
 func TestHandleSubscriptionsListen_MergesAndRewritesEvents(t *testing.T) {
 	// Each backend emits one resources/updated notification with an upstream URI;
 	// the gateway must re-prefix each URI into the downstream namespace and forward
@@ -1370,7 +1403,7 @@ func TestHandleSubscriptionsListen_MergesAndRewritesEvents(t *testing.T) {
 	defer cancel()
 
 	r := newModernRequest("subscriptions/listen").WithContext(ctx)
-	rr := httptest.NewRecorder()
+	rr := &concurrentRecorder{ResponseRecorder: httptest.NewRecorder()}
 	req := modernReq(t, "subscriptions/listen", []byte(`{"notifications":{"resourceSubscriptions":["file:///watched-backend1"]}}`))
 
 	done := make(chan struct{})
@@ -1379,9 +1412,9 @@ func TestHandleSubscriptionsListen_MergesAndRewritesEvents(t *testing.T) {
 		close(done)
 	}()
 
-	// Give the backends time to emit their events, then cancel to unblock the merge loop.
+	// Poll a mutex-protected body snapshot; the handler writes concurrently.
 	require.Eventually(t, func() bool {
-		body := rr.Body.String()
+		body := rr.bodyString()
 		return strings.Contains(body, downstreamResourceURI("file:///watched-backend1", "backend1")) &&
 			strings.Contains(body, downstreamResourceURI("file:///watched-backend2", "backend2"))
 	}, time.Second, 10*time.Millisecond)
