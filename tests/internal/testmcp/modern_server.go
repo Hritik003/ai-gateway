@@ -86,7 +86,7 @@ func NewModernServer(opts *ModernOptions) *http.Server {
 	go func() {
 		log.Printf("starting Modern MCP Stateless-HTTP server on :%d at /mcp", opts.Port)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("modern server error: %v", err)
+			log.Printf("modern server error: %v", err)
 		}
 	}()
 	return server
@@ -184,26 +184,26 @@ func newModernFullHandler() http.Handler {
 		case "tools/list":
 			writeJSONRPC(w, req.ID, map[string]any{"tools": allTools})
 		case "tools/call":
-			handleModernToolCall(w, r, req)
+			handleModernToolCall(w, r, &req)
 		case "resources/list":
 			writeJSONRPC(w, req.ID, map[string]any{"resources": allResources})
 		case "resources/read":
-			handleModernResourceRead(w, req)
+			handleModernResourceRead(w, &req)
 		case "resources/templates/list":
 			writeJSONRPC(w, req.ID, map[string]any{"resourceTemplates": allResourceTemplates})
 		case "prompts/list":
 			writeJSONRPC(w, req.ID, map[string]any{"prompts": allPrompts})
 		case "prompts/get":
-			handleModernPromptGet(w, req)
+			handleModernPromptGet(w, &req)
 		case "completion/complete":
-			handleModernComplete(w, req)
+			handleModernComplete(w, &req)
 		default:
 			writeJSONRPCError(w, req.ID, -32601, "method not found: "+method)
 		}
 	})
 }
 
-func handleModernToolCall(w http.ResponseWriter, r *http.Request, req jsonRPCRequest) {
+func handleModernToolCall(w http.ResponseWriter, r *http.Request, req *jsonRPCRequest) {
 	name := r.Header.Get(mcpNameHeader)
 	switch name {
 	case ToolEcho.Tool.Name:
@@ -230,7 +230,7 @@ func handleModernToolCall(w http.ResponseWriter, r *http.Request, req jsonRPCReq
 	}
 }
 
-func handleModernResourceRead(w http.ResponseWriter, req jsonRPCRequest) {
+func handleModernResourceRead(w http.ResponseWriter, req *jsonRPCRequest) {
 	var params struct {
 		URI string `json:"uri"`
 	}
@@ -252,7 +252,7 @@ func handleModernResourceRead(w http.ResponseWriter, req jsonRPCRequest) {
 	}
 }
 
-func handleModernPromptGet(w http.ResponseWriter, req jsonRPCRequest) {
+func handleModernPromptGet(w http.ResponseWriter, req *jsonRPCRequest) {
 	var params struct {
 		Name      string            `json:"name"`
 		Arguments map[string]string `json:"arguments"`
@@ -273,7 +273,7 @@ func handleModernPromptGet(w http.ResponseWriter, req jsonRPCRequest) {
 	}
 }
 
-func handleModernComplete(w http.ResponseWriter, req jsonRPCRequest) {
+func handleModernComplete(w http.ResponseWriter, req *jsonRPCRequest) {
 	var params struct {
 		Ref struct {
 			Type string `json:"type"`

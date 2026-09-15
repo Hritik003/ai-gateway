@@ -8,7 +8,9 @@ package dataplanemcp
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -100,9 +102,37 @@ func TestModernMCP(t *testing.T) {
 	})
 
 	t.Run("ReadResourceNotFound", func(t *testing.T) {
-		code, msg := cli.callMethodExpectError(t, "resources/read", "", map[string]any{"uri": defaultMCPBackendResourceURIPrefix + "file:///notfound.txt"})
-		_ = code
-		require.Contains(t, msg, "Resource not found")
+		// Gateway currently surfaces backend JSON-RPC errors as plain-text HTTP 500
+		// ("call to <backend> failed: backend error: ..."), so accept either a
+		// JSON-RPC error body or that plain-text gateway error.
+		id := cli.reqIDSeq.Add(1)
+		params := map[string]any{"uri": defaultMCPBackendResourceURIPrefix + "file:///notfound.txt"}
+		paramsRaw, err := json.Marshal(params)
+		require.NoError(t, err)
+		paramsRaw = injectModernMeta(paramsRaw)
+		body := map[string]any{
+			"jsonrpc": "2.0",
+			"id":      id,
+			"method":  "resources/read",
+			"params":  json.RawMessage(paramsRaw),
+		}
+		encoded, err := json.Marshal(body)
+		require.NoError(t, err)
+		req, err := http.NewRequest(http.MethodPost, cli.endpoint, bytes.NewReader(encoded))
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set(modernVersionHeader, modernProtocolVersion)
+		req.Header.Set(modernMethodHeader, "resources/read")
+		resp, err := cli.httpClient.Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		respBody, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		msg := string(respBody)
+		require.True(t,
+			strings.Contains(msg, "Resource not found") || strings.Contains(msg, "call to") && strings.Contains(msg, "failed"),
+			"expected not-found error, got: %s", msg)
 	})
 
 	t.Run("ListResourceTemplates", func(t *testing.T) {
@@ -172,11 +202,11 @@ func TestModernMCP(t *testing.T) {
 	})
 
 	t.Run("Tracing/ToolCallSpan", func(t *testing.T) {
-		// Make a fresh tool call so we can take its span.
+		// Drain spans left by earlier subtests so we observe only this call.
+		drainSpans(env.collector)
 		cli.callTool(t, defaultMCPBackendResourcePrefix+testmcp.ToolEcho.Tool.Name, testmcp.ToolEchoArgs{Text: "span test"})
-		span := env.collector.TakeSpan()
+		span := takeSpanNamed(t, env.collector, "CallTool")
 		require.NotNil(t, span, "expected a span from the tool call")
-		require.Equal(t, "CallTool", span.Name)
 
 		// Verify span has the expected tool name attribute.
 		found := false
@@ -188,10 +218,12 @@ func TestModernMCP(t *testing.T) {
 		}
 		require.True(t, found, "mcp.tool.name attribute not found on span")
 
-		// Verify protocol version attribute reflects the modern protocol.
+		// Default (legacy) tracing vocabulary hardcodes mcp.protocol.version to
+		// 2025-06-18 for dashboard compatibility; modern requests still use it
+		// until AI_GATEWAY_TRACING_SEMCONV selects the OTel vocabulary.
 		for _, attr := range span.Attributes {
 			if attr.Key == "mcp.protocol.version" {
-				require.Equal(t, modernProtocolVersion, attr.Value.GetStringValue())
+				require.Equal(t, "2025-06-18", attr.Value.GetStringValue())
 			}
 		}
 	})

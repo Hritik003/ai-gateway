@@ -71,7 +71,7 @@ func (c *modernClient) callMethod(t *testing.T, method string, name string, para
 		"jsonrpc": "2.0",
 		"id":      id,
 		"method":  method,
-		"params":  json.RawMessage(paramsRaw),
+		"params":  paramsRaw,
 	}
 	encoded, err := json.Marshal(body)
 	require.NoError(t, err)
@@ -106,57 +106,6 @@ func (c *modernClient) callMethod(t *testing.T, method string, name string, para
 		t.Fatalf("JSON-RPC error for %s: code=%d msg=%s", method, envelope.Error.Code, envelope.Error.Message)
 	}
 	return &modernResult{raw: envelope.Result}
-}
-
-// callMethodExpectError sends a modern JSON-RPC request and expects an error response.
-func (c *modernClient) callMethodExpectError(t *testing.T, method string, name string, params any) (int, string) {
-	t.Helper()
-	id := c.reqIDSeq.Add(1)
-
-	var paramsRaw json.RawMessage
-	if params != nil {
-		var err error
-		paramsRaw, err = json.Marshal(params)
-		require.NoError(t, err)
-	} else {
-		paramsRaw = json.RawMessage(`{}`)
-	}
-	paramsRaw = injectModernMeta(paramsRaw)
-
-	body := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      id,
-		"method":  method,
-		"params":  json.RawMessage(paramsRaw),
-	}
-	encoded, err := json.Marshal(body)
-	require.NoError(t, err)
-
-	req, err := http.NewRequest(http.MethodPost, c.endpoint, bytes.NewReader(encoded))
-	require.NoError(t, err)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set(modernVersionHeader, modernProtocolVersion)
-	req.Header.Set(modernMethodHeader, method)
-	if name != "" {
-		req.Header.Set(modernNameHeader, name)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	respBody, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-
-	var envelope struct {
-		Error *struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	require.NoError(t, json.Unmarshal(respBody, &envelope))
-	require.NotNilf(t, envelope.Error, "expected JSON-RPC error for %s, got: %s", method, string(respBody))
-	return envelope.Error.Code, envelope.Error.Message
 }
 
 // injectModernMeta injects _meta with protocolVersion and clientCapabilities into params.
