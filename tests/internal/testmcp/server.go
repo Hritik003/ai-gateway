@@ -18,9 +18,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/envoyproxy/ai-gateway/internal/json"
-
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/envoyproxy/ai-gateway/internal/json"
 )
 
 var logger = log.New(os.Stdout, "[mcptestserver] ", 0)
