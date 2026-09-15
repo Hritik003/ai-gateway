@@ -8,7 +8,6 @@ package testmcp
 import (
 	"cmp"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +17,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/envoyproxy/ai-gateway/internal/json"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
