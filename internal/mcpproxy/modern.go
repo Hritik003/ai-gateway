@@ -183,8 +183,8 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 }
 
 // resolveModernRouteBackends looks up the route and evaluates backendSelector
-// against this request. The returned map is the only backend set modern
-// handlers may talk to. Writes 404 (unknown route) or 403 (no matching
+// against this request. The returned map is the only backend set discovery and
+// list fan-out may talk to. Writes 404 (unknown route) or 403 (no matching
 // backends) on failure.
 //
 // Header extraction matches newSession: route-level forwardHeaders are read
