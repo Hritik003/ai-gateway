@@ -263,8 +263,11 @@ func requireNewMCPEnvWithExtProcEnv(t *testing.T, extraEnv []string, forceJSONRe
 // newSession creates a new MCP client session and registers it for progress notifications.
 func (m *mcpEnv) newSession(t *testing.T) *mcpSession {
 	ret := m.newSessionWithoutSpanCheck(t)
-	span := m.collector.TakeSpan()
-	t.Log("created new MCP session with ID ", ret.session.ID(), ", first span: ", span.String())
+	// go-sdk v1.7+ probes server/discover before falling back to initialize.
+	// Legacy test backends reject discover, so Connect emits a failed discover
+	// span followed by the Initialize span we assert here.
+	span := takeSpanNamed(t, m.collector, "Initialize")
+	t.Log("created new MCP session with ID ", ret.session.ID(), ", initialize span: ", span.String())
 	requireMCPSpan(t, span, "Initialize", map[string]string{
 		"mcp.method.name":    "initialize",
 		"mcp.client.name":    "demo-http-client",
@@ -388,6 +391,31 @@ func backendsFromSpan(t *testing.T, span *tracev1.Span) []string {
 		}
 	}
 	return backends
+}
+
+// takeSpanNamed drains collector spans until one with the given name appears.
+// Used when Connect probes server/discover before initialize, leaving an extra span.
+func takeSpanNamed(t *testing.T, collector *testotel.OTLPCollector, name string) *tracev1.Span {
+	t.Helper()
+	for range 10 {
+		span := collector.TakeSpan()
+		require.NotNil(t, span, "expected span %q, collector drained", name)
+		if span.Name == name {
+			return span
+		}
+		t.Logf("skipping intermediate span %q while waiting for %q", span.Name, name)
+	}
+	require.FailNowf(t, "span not found", "did not see span named %q", name)
+	return nil
+}
+
+// drainSpans discards any pending spans in the collector (best-effort, short timeout each).
+func drainSpans(collector *testotel.OTLPCollector) {
+	for range 20 {
+		if collector.TakeSpan() == nil {
+			return
+		}
+	}
 }
 
 // modernMCPEnv holds the test environment for modern (2026-07-28) MCP dataplane tests.

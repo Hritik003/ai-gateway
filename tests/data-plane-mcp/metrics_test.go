@@ -6,10 +6,12 @@
 package dataplanemcp
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 
 	"github.com/envoyproxy/ai-gateway/tests/internal/testmcp"
@@ -128,17 +130,18 @@ func TestMCPMetrics(t *testing.T) {
 		}, 0)
 	})
 
-	t.Run("mcp_request_duration_seconds/success", func(t *testing.T) {
+	t.Run("mcp_request_duration/success", func(t *testing.T) {
 		// The request duration histogram should have observations.
+		// OTel prometheus exporter names this mcp_request_duration (no unit suffix).
 		require.Eventually(t, func() bool {
 			metrics, err := retrieveMetrics(env.extProcMetricsURL, retrieveMetricsTime)
 			if err != nil {
 				t.Log("failed to retrieve metrics:", err)
 				return false
 			}
-			family, ok := metrics["mcp_request_duration_seconds"]
-			if !ok {
-				t.Log("mcp_request_duration_seconds not found")
+			family := findHistogramFamily(metrics, "mcp_request_duration")
+			if family == nil {
+				t.Log("mcp_request_duration histogram not found")
 				return false
 			}
 			for _, m := range family.Metric {
@@ -150,16 +153,16 @@ func TestMCPMetrics(t *testing.T) {
 		}, retrieveMetricsTime, retrieveMetricsTick)
 	})
 
-	t.Run("mcp_initialization_duration_seconds", func(t *testing.T) {
+	t.Run("mcp_initialization_duration", func(t *testing.T) {
 		require.Eventually(t, func() bool {
 			metrics, err := retrieveMetrics(env.extProcMetricsURL, retrieveMetricsTime)
 			if err != nil {
 				t.Log("failed to retrieve metrics:", err)
 				return false
 			}
-			family, ok := metrics["mcp_initialization_duration_seconds"]
-			if !ok {
-				t.Log("mcp_initialization_duration_seconds not found")
+			family := findHistogramFamily(metrics, "mcp_initialization_duration")
+			if family == nil {
+				t.Log("mcp_initialization_duration histogram not found")
 				return false
 			}
 			for _, m := range family.Metric {
@@ -222,15 +225,15 @@ func TestModernMCPMetrics(t *testing.T) {
 		}, 0)
 	})
 
-	t.Run("mcp_request_duration_seconds/modern", func(t *testing.T) {
+	t.Run("mcp_request_duration/modern", func(t *testing.T) {
 		require.Eventually(t, func() bool {
 			metrics, err := retrieveMetrics(env.extProcMetricsURL, retrieveMetricsTime)
 			if err != nil {
 				t.Log("failed to retrieve metrics:", err)
 				return false
 			}
-			family, ok := metrics["mcp_request_duration_seconds"]
-			if !ok {
+			family := findHistogramFamily(metrics, "mcp_request_duration")
+			if family == nil {
 				return false
 			}
 			for _, m := range family.Metric {
@@ -254,4 +257,18 @@ func requireModernMetricGreaterThan(t *testing.T, m *modernMCPEnv, metricName st
 		}
 		return current > prev
 	}, retrieveMetricsTime, retrieveMetricsTick)
+}
+
+// findHistogramFamily finds a histogram metric family by exact name or common
+// OTel prometheus suffixes (_seconds, _token, etc.).
+func findHistogramFamily(metrics map[string]*dto.MetricFamily, prefix string) *dto.MetricFamily {
+	if family, ok := metrics[prefix]; ok {
+		return family
+	}
+	for name, family := range metrics {
+		if strings.HasPrefix(name, prefix) && family.GetType() == dto.MetricType_HISTOGRAM {
+			return family
+		}
+	}
+	return nil
 }
