@@ -709,7 +709,7 @@ func TestSendToAllModernBackends_NoBackendsSelected(t *testing.T) {
 }
 
 func TestHandleModernToolsList_PartialFailure(t *testing.T) {
-	respFn := func(backend, _ string) any {
+	respFn := func(_, _ string) any {
 		return mcp.ListToolsResult{Tools: []*mcp.Tool{{Name: "search"}}}
 	}
 	server := httptest.NewServer(modernBackendHandler(t, nil, map[string]bool{"backend1": true}, respFn))
@@ -738,7 +738,7 @@ func TestHandleModernToolsList_PartialFailure(t *testing.T) {
 }
 
 func TestHandleModernToolsList_AllBackendsFail(t *testing.T) {
-	respFn := func(backend, _ string) any {
+	respFn := func(_, _ string) any {
 		return mcp.ListToolsResult{Tools: []*mcp.Tool{{Name: "search"}}}
 	}
 	server := httptest.NewServer(modernBackendHandler(t, nil, map[string]bool{"backend1": true, "backend2": true}, respFn))
