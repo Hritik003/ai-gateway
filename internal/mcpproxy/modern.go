@@ -46,6 +46,15 @@ const (
 	defaultResourcesReadCacheScope = "private"
 )
 
+// subscriptionListenIntent captures the client's original subscriptions/listen
+// opt-ins so outbound notifications can be filtered after backend fan-out.
+type subscriptionListenIntent struct {
+	resourceURIs         map[string]struct{} // gateway-namespaced URIs the client asked for
+	toolsListChanged     bool
+	promptsListChanged   bool
+	resourcesListChanged bool
+}
+
 // serveModernPOST handles modern (2026-07-28) stateless POST requests.
 // This is the Phase 1 entry point for modern clients talking to modern backends.
 // The JSON-RPC request has already been parsed by servePOST.
@@ -600,46 +609,8 @@ func (m *mcpRequestContext) handleModernToolsCall(ctx context.Context, w http.Re
 	// Interim MRTR results (resultType: "input_required") are passed through verbatim.
 	return m.sendModernRequestAndProxy(ctx, w, req, route, backend, result, span,
 		func(resp json.RawMessage) (json.RawMessage, bool) {
-			return rewriteToolsCallResult(resp, backendName, m.l)
+			return rewriteToolsCallResult(resp, backendName)
 		})
-}
-
-// rewriteToolsCallResult re-prefixes resource URIs in a complete tools/call
-// result back to the gateway's downstream namespace. It returns (rewritten,
-// true) when the result was successfully re-encoded, or (nil, false) when the
-// caller should pass the result through verbatim: a non-complete (MRTR
-// input_required) result, a non-standard result shape the backend owns, or a
-// result with no URIs to rewrite.
-func rewriteToolsCallResult(resp json.RawMessage, backendName filterapi.MCPBackendName, l *slog.Logger) (json.RawMessage, bool) {
-	// Non-complete (input_required) results are not standard CallToolResults and
-	// must pass through untouched so MRTR state survives.
-	var check map[string]json.RawMessage
-	if json.Unmarshal(resp, &check) == nil {
-		if rt, ok := check["resultType"]; ok {
-			var s string
-			if json.Unmarshal(rt, &s) == nil && s != "" && s != "complete" {
-				return nil, false
-			}
-		}
-		if _, ok := check["inputRequests"]; ok {
-			return nil, false
-		}
-	}
-
-	result := &mcp.CallToolResult{}
-	if err := json.Unmarshal(resp, result); err != nil {
-		// Non-standard result shape: pass through unchanged since the backend owns it.
-		l.Debug("tools/call result is not a standard CallToolResult, skipping URI rewrite", slog.String("error", err.Error()))
-		return nil, false
-	}
-	if !rewriteToolResultURIs(result, backendName) {
-		return nil, false
-	}
-	out, err := json.Marshal(result)
-	if err != nil {
-		return nil, false
-	}
-	return out, true
 }
 
 // handleModernResourcesRead handles resources/read (P1.5 single-target).
@@ -691,7 +662,8 @@ func (m *mcpRequestContext) handleModernResourcesRead(ctx context.Context, w htt
 // on a complete resources/read result. Per the MCP caching SEP, servers MUST
 // include ttlMs/cacheScope on resultType:"complete" resources/read responses;
 // interim MRTR results (resultType:"input_required") are not cacheable and are
-// left untouched. Operates on the raw JSON map so unknown fields are preserved.
+// left untouched. URI rewriting is shared with legacy via
+// rewriteResourcesReadContentsURIs so unknown fields are preserved.
 // Returns (rewritten, true) for a complete result, or (nil, false) when the
 // caller should pass the result through verbatim.
 //
@@ -712,25 +684,7 @@ func rewriteResourcesReadResult(result json.RawMessage, backendName string) (jso
 		return nil, false
 	}
 
-	if raw, ok := m["contents"]; ok {
-		var contents []map[string]json.RawMessage
-		if json.Unmarshal(raw, &contents) == nil {
-			for _, c := range contents {
-				uriRaw, ok := c["uri"]
-				if !ok {
-					continue
-				}
-				var uri string
-				if json.Unmarshal(uriRaw, &uri) == nil && uri != "" {
-					prefixed, _ := json.Marshal(downstreamResourceURI(uri, backendName))
-					c["uri"] = prefixed
-				}
-			}
-			if out, err := json.Marshal(contents); err == nil {
-				m["contents"] = out
-			}
-		}
-	}
+	_ = rewriteResourcesReadContentsURIs(m, backendName)
 
 	// Inject caching hints when the backend omits them (or sends an empty
 	// cacheScope from a zero-value Cacheable). ttlMs defaults to 0 (immediately
@@ -862,16 +816,41 @@ func (m *mcpRequestContext) handleModernComplete(ctx context.Context, w http.Res
 // does not fit the request-duration metric shape. It sets
 // perBackendMetricsRecorded to skip the generic recording in serveModernPOST,
 // mirroring how the legacy path treats streaming/notification methods.
+//
+// Resource subscription URIs are gateway-namespaced (backend+scheme://…). Before
+// fan-out they are partitioned by owning backend and sent upstream unprefixed,
+// matching every other single-target handler. Notifications are filtered against
+// the client's original opt-ins before forwarding.
 func (m *mcpRequestContext) handleSubscriptionsListen(ctx context.Context, w http.ResponseWriter, r *http.Request, req *jsonrpc.Request, route filterapi.MCPRouteName, span tracingapi.MCPSpan) (handlerResult, error) {
 	m.perBackendMetricsRecorded = true
 	m.requestHeaders = r.Header
 
-	_, selected, err := m.resolveModernRouteBackends(w, route)
+	routeConfig, selected, err := m.resolveModernRouteBackends(w, route)
 	if err != nil {
 		return handlerResult{}, err
 	}
 
-	// Set SSE response headers.
+	var params mcp.SubscriptionsListenParams
+	if err = json.Unmarshal(req.Params, &params); err != nil {
+		onErrorResponse(w, http.StatusBadRequest, "invalid subscriptions/listen params")
+		return handlerResult{}, fmt.Errorf("invalid subscriptions/listen params: %w", &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: err.Error()})
+	}
+
+	intent, perBackendURIs, err := partitionResourceSubscriptions(params.Notifications)
+	if err != nil {
+		onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid resource subscription URI: %v", err))
+		return handlerResult{}, err
+	}
+	for backendName := range perBackendURIs {
+		if _, err := lookupSelectedBackend(w, routeConfig, selected, backendName); err != nil {
+			return handlerResult{}, err
+		}
+	}
+
+	wantListChanged := intent.toolsListChanged || intent.promptsListChanged || intent.resourcesListChanged
+
+	// Set SSE response headers only after params are validated — a 400 cannot
+	// follow a started event-stream.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -881,15 +860,32 @@ func (m *mcpRequestContext) handleSubscriptionsListen(ctx context.Context, w htt
 		flusher.Flush()
 	}
 
-	// Fan out subscriptions/listen to the selected backends and parse each
-	// stream so we can rewrite backend-scoped notification payloads (e.g.
-	// resources/updated URIs) into the gateway's downstream namespace before forwarding.
+	// Fan out a per-backend listen request: only backends that own a subscribed
+	// URI (or that must receive list_changed opt-ins) are contacted, and each
+	// sees bare upstream URIs rather than gateway-namespaced ones.
 	events := make(chan *sseEvent)
 	var wg sync.WaitGroup
 	for _, backend := range selected {
-		body, _ := jsonrpc.EncodeMessage(req)
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, m.backendListenerAddr, bytes.NewReader(body))
-		if err != nil {
+		uris := perBackendURIs[backend.Name]
+		if len(uris) == 0 && !wantListChanged {
+			continue
+		}
+		backendParams := buildBackendListenParams(&params, uris)
+		paramsBytes, marshalErr := json.Marshal(backendParams)
+		if marshalErr != nil {
+			continue
+		}
+		backendReq := &jsonrpc.Request{
+			Method: req.Method,
+			ID:     req.ID,
+			Params: paramsBytes,
+		}
+		body, encErr := jsonrpc.EncodeMessage(backendReq)
+		if encErr != nil {
+			continue
+		}
+		httpReq, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, m.backendListenerAddr, bytes.NewReader(body))
+		if reqErr != nil {
 			continue
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
@@ -899,9 +895,9 @@ func (m *mcpRequestContext) handleSubscriptionsListen(ctx context.Context, w htt
 		httpReq.Header.Set(internalapi.MCPBackendHeader, backend.Name)
 		httpReq.Header.Set(internalapi.MCPRouteHeader, route)
 
-		resp, err := m.client.Do(httpReq)
-		if err != nil {
-			m.l.Warn("subscriptions/listen failed", slog.String("backend", backend.Name), slog.String("error", err.Error()))
+		resp, doErr := m.client.Do(httpReq)
+		if doErr != nil {
+			m.l.Warn("subscriptions/listen failed", slog.String("backend", backend.Name), slog.String("error", doErr.Error()))
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
@@ -940,20 +936,33 @@ func (m *mcpRequestContext) handleSubscriptionsListen(ctx context.Context, w htt
 		close(events)
 	}()
 
-	// Merge loop: forward rewritten events to the client, sending periodic
-	// keep-alives while idle.
+	// Merge loop: forward rewritten, intent-filtered events to the client,
+	// sending periodic keep-alives while idle. When all backends close
+	// (gracefully or otherwise), the gateway writes a completion result per
+	// the subscriptions spec before returning.
 	keepAlive := time.NewTicker(15 * time.Second)
 	defer keepAlive.Stop()
 	done := ctx.Done()
 	for {
 		select {
 		case <-done:
+			// Client disconnected — on Streamable HTTP this IS the
+			// cancellation signal per the spec. Upstream bodies are closed
+			// by deferred resp.Body.Close, tearing down backend streams.
 			return handlerResult{}, nil
 		case event, ok := <-events:
 			if !ok {
+				// All backend streams ended. Write a graceful completion
+				// result so the client knows the subscription closed cleanly
+				// rather than via a transport drop.
+				// https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/subscriptions#graceful-closure
+				writeSSECompletionResult(w, req.ID)
+				if flusher != nil {
+					flusher.Flush()
+				}
 				return handlerResult{}, nil
 			}
-			m.forwardSubscriptionEvent(w, event)
+			m.forwardSubscriptionEvent(w, event, intent)
 			if flusher != nil {
 				flusher.Flush()
 			}
@@ -966,31 +975,180 @@ func (m *mcpRequestContext) handleSubscriptionsListen(ctx context.Context, w htt
 	}
 }
 
-// forwardSubscriptionEvent rewrites and forwards a single SSE notification event
-// from a backend to the downstream client. It de-prefixes resources/updated URIs
-// into the gateway's downstream namespace before forwarding.
-func (m *mcpRequestContext) forwardSubscriptionEvent(w io.Writer, event *sseEvent) {
+// partitionResourceSubscriptions splits gateway-namespaced resource subscription
+// URIs by owning backend, returning the client's intent (namespaced URIs + list
+// flags) and a per-backend list of bare upstream URIs. URIs that do not parse
+// fail the request; callers must still verify each backend is selected.
+func partitionResourceSubscriptions(notifs *mcp.NotificationSubscriptions) (subscriptionListenIntent, map[filterapi.MCPBackendName][]string, error) {
+	intent := subscriptionListenIntent{resourceURIs: make(map[string]struct{})}
+	perBackend := make(map[filterapi.MCPBackendName][]string)
+	if notifs == nil {
+		return intent, perBackend, nil
+	}
+	intent.toolsListChanged = notifs.ToolsListChanged
+	intent.promptsListChanged = notifs.PromptsListChanged
+	intent.resourcesListChanged = notifs.ResourcesListChanged
+
+	for _, uri := range notifs.ResourceSubscriptions {
+		backendName, upstreamURI, err := upstreamResourceURI(uri)
+		if err != nil {
+			return subscriptionListenIntent{}, nil, fmt.Errorf("%w: %s", err, uri)
+		}
+		intent.resourceURIs[uri] = struct{}{}
+		perBackend[backendName] = append(perBackend[backendName], upstreamURI)
+	}
+	return intent, perBackend, nil
+}
+
+// buildBackendListenParams copies the client listen params with resource
+// subscriptions replaced by the bare upstream URIs for one backend.
+func buildBackendListenParams(client *mcp.SubscriptionsListenParams, upstreamURIs []string) *mcp.SubscriptionsListenParams {
+	out := &mcp.SubscriptionsListenParams{Meta: client.Meta}
+	if client.Notifications == nil {
+		return out
+	}
+	n := *client.Notifications
+	n.ResourceSubscriptions = append([]string(nil), upstreamURIs...)
+	out.Notifications = &n
+	return out
+}
+
+// forwardSubscriptionEvent rewrites and conditionally forwards a single SSE
+// notification event from a backend to the downstream client. resources/updated
+// URIs are re-prefixed into the gateway namespace; notifications the client did
+// not opt into are dropped. Backend graceful-closure responses (jsonrpc.Response
+// to the listen request) are silently consumed — the gateway synthesizes its own
+// completion result once all backends close. notifications/cancelled from a
+// backend (server-initiated teardown) is forwarded to the client.
+func (m *mcpRequestContext) forwardSubscriptionEvent(w io.Writer, event *sseEvent, intent subscriptionListenIntent) {
+	kept := event.messages[:0]
 	for _, msg := range event.messages {
-		req, ok := msg.(*jsonrpc.Request)
-		if !ok || req == nil {
+		switch v := msg.(type) {
+		case *jsonrpc.Response:
+			// Backend sent a graceful completion result for its listen
+			// request. Swallow it; the gateway emits its own once all
+			// backend streams end.
+			continue
+		case *jsonrpc.Request:
+			if v == nil {
+				continue
+			}
+			switch v.Method {
+			case "notifications/resources/updated":
+				rewritten, ok := rewriteUpdatedURI(json.RawMessage(v.Params), event.backend)
+				if !ok {
+					continue
+				}
+				v.Params = []byte(rewritten)
+				var envelope struct {
+					URI string `json:"uri"`
+				}
+				if json.Unmarshal(rewritten, &envelope) != nil {
+					continue
+				}
+				if _, subscribed := intent.resourceURIs[envelope.URI]; !subscribed {
+					continue
+				}
+			case "notifications/tools/list_changed":
+				if !intent.toolsListChanged {
+					continue
+				}
+			case "notifications/resources/list_changed":
+				if !intent.resourcesListChanged {
+					continue
+				}
+			case "notifications/prompts/list_changed":
+				if !intent.promptsListChanged {
+					continue
+				}
+			case "notifications/subscriptions/acknowledged":
+				if rewritten, ok := rewriteAcknowledgedSubscriptions(json.RawMessage(v.Params), event.backend); ok {
+					v.Params = []byte(rewritten)
+				}
+			case "notifications/cancelled":
+				// Server-initiated subscription teardown (spec: server MUST
+				// send this when it tears down the stream). Forward as-is.
+			default:
+				// Unknown notification type — forward for extensibility.
+			}
+		default:
 			continue
 		}
-		switch req.Method {
-		case "notifications/resources/updated":
-			// Re-prefix the resource URI so the client sees the same namespaced
-			// URI it subscribed with.
-			if rewritten, ok := rewriteUpdatedURI(json.RawMessage(req.Params), event.backend); ok {
-				req.Params = []byte(rewritten)
-			}
-		case "notifications/tools/list_changed",
-			"notifications/resources/list_changed",
-			"notifications/prompts/list_changed":
-			// A backend's primitive list changed. There is no discover cache to
-			// invalidate right now (removed pending a caching strategy); the
-			// notification is still forwarded downstream below so clients can react.
-		}
+		kept = append(kept, msg)
 	}
+	if len(kept) == 0 {
+		return
+	}
+	event.messages = kept
 	event.writeAndMaybeFlush(w)
+}
+
+// writeSSECompletionResult writes a graceful subscriptions/listen completion
+// result as an SSE event. Per the spec, the server SHOULD respond with
+// resultType:"complete" before closing the stream so the client knows the
+// subscription ended cleanly.
+// https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/subscriptions#graceful-closure
+func writeSSECompletionResult(w io.Writer, listenID jsonrpc.ID) {
+	result := map[string]any{
+		"resultType": "complete",
+	}
+	encoded, _ := json.Marshal(result)
+	resp := &jsonrpc.Response{ID: listenID, Result: encoded}
+	data, _ := jsonrpc.EncodeMessage(resp)
+	_, _ = w.Write([]byte("event: message\n"))
+	_, _ = w.Write([]byte("data: "))
+	_, _ = w.Write(data)
+	_, _ = w.Write([]byte("\n\n"))
+}
+
+// rewriteAcknowledgedSubscriptions re-prefixes resourceSubscriptions URIs in a
+// notifications/subscriptions/acknowledged params payload so the client sees the
+// same gateway-namespaced URIs it requested.
+func rewriteAcknowledgedSubscriptions(params json.RawMessage, backendName string) (json.RawMessage, bool) {
+	if len(params) == 0 {
+		return nil, false
+	}
+	var m map[string]json.RawMessage
+	if json.Unmarshal(params, &m) != nil {
+		return nil, false
+	}
+	notifsRaw, ok := m["notifications"]
+	if !ok {
+		return nil, false
+	}
+	var notifs map[string]json.RawMessage
+	if json.Unmarshal(notifsRaw, &notifs) != nil {
+		return nil, false
+	}
+	urisRaw, ok := notifs["resourceSubscriptions"]
+	if !ok {
+		return nil, false
+	}
+	var uris []string
+	if json.Unmarshal(urisRaw, &uris) != nil {
+		return nil, false
+	}
+	if len(uris) == 0 {
+		return nil, false
+	}
+	for i, uri := range uris {
+		uris[i] = downstreamResourceURI(uri, backendName)
+	}
+	prefixed, err := json.Marshal(uris)
+	if err != nil {
+		return nil, false
+	}
+	notifs["resourceSubscriptions"] = prefixed
+	notifsOut, err := json.Marshal(notifs)
+	if err != nil {
+		return nil, false
+	}
+	m["notifications"] = notifsOut
+	out, err := json.Marshal(m)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
 }
 
 // rewriteUpdatedURI re-prefixes the "uri" field in a notifications/resources/updated
