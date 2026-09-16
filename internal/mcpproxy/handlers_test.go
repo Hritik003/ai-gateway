@@ -497,49 +497,62 @@ func Test_rewriteMetaResourceURIs(t *testing.T) {
 	}
 }
 
-func Test_rewriteToolResultURIs(t *testing.T) {
+func Test_rewriteToolsCallResult(t *testing.T) {
 	backend := filterapi.MCPBackendName("backend1")
 
+	mustRewrite := func(t *testing.T, in *mcp.CallToolResult) mcp.CallToolResult {
+		t.Helper()
+		raw, err := json.Marshal(in)
+		require.NoError(t, err)
+		out, ok := rewriteToolsCallResult(raw, backend)
+		require.True(t, ok)
+		var got mcp.CallToolResult
+		require.NoError(t, json.Unmarshal(out, &got))
+		return got
+	}
+
 	t.Run("rewrites ResourceLink URI", func(t *testing.T) {
-		result := &mcp.CallToolResult{
+		got := mustRewrite(t, &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.ResourceLink{URI: "ui://prefab/link.html"}},
-		}
-		require.True(t, rewriteToolResultURIs(result, backend))
-		require.Equal(t, "ui://backend1/prefab/link.html", result.Content[0].(*mcp.ResourceLink).URI)
+		})
+		require.Equal(t, "ui://backend1/prefab/link.html", got.Content[0].(*mcp.ResourceLink).URI)
 	})
 
 	t.Run("rewrites EmbeddedResource URI", func(t *testing.T) {
-		result := &mcp.CallToolResult{
+		got := mustRewrite(t, &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.EmbeddedResource{Resource: &mcp.ResourceContents{URI: "ui://prefab/embed.html"}}},
-		}
-		require.True(t, rewriteToolResultURIs(result, backend))
-		require.Equal(t, "ui://backend1/prefab/embed.html", result.Content[0].(*mcp.EmbeddedResource).Resource.URI)
+		})
+		require.Equal(t, "ui://backend1/prefab/embed.html", got.Content[0].(*mcp.EmbeddedResource).Resource.URI)
 	})
 
 	t.Run("nil EmbeddedResource.Resource", func(t *testing.T) {
-		result := &mcp.CallToolResult{Content: []mcp.Content{&mcp.EmbeddedResource{Resource: nil}}}
-		require.False(t, rewriteToolResultURIs(result, backend))
+		raw, err := json.Marshal(&mcp.CallToolResult{Content: []mcp.Content{&mcp.EmbeddedResource{Resource: nil}}})
+		require.NoError(t, err)
+		out, ok := rewriteToolsCallResult(raw, backend)
+		require.False(t, ok)
+		require.Nil(t, out)
 	})
 
 	t.Run("rewrites _meta.ui.resourceUri", func(t *testing.T) {
-		result := &mcp.CallToolResult{
+		got := mustRewrite(t, &mcp.CallToolResult{
 			Meta: mcp.Meta{"ui": map[string]any{"resourceUri": "ui://meta/renderer.html"}},
-		}
-		require.True(t, rewriteToolResultURIs(result, backend))
-		require.Equal(t, "ui://backend1/meta/renderer.html", result.Meta["ui"].(map[string]any)["resourceUri"])
+		})
+		require.Equal(t, "ui://backend1/meta/renderer.html", got.Meta["ui"].(map[string]any)["resourceUri"])
 	})
 
 	t.Run("non-ui URIs are namespaced with the scheme prefix form", func(t *testing.T) {
-		result := &mcp.CallToolResult{
+		got := mustRewrite(t, &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.ResourceLink{URI: "file:///tmp/file.txt"}},
-		}
-		require.True(t, rewriteToolResultURIs(result, backend))
-		require.Equal(t, "backend1+file:///tmp/file.txt", result.Content[0].(*mcp.ResourceLink).URI)
+		})
+		require.Equal(t, "backend1+file:///tmp/file.txt", got.Content[0].(*mcp.ResourceLink).URI)
 	})
 
 	t.Run("no resource URIs", func(t *testing.T) {
-		result := &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "hi"}}}
-		require.False(t, rewriteToolResultURIs(result, backend))
+		raw, err := json.Marshal(&mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "hi"}}})
+		require.NoError(t, err)
+		out, ok := rewriteToolsCallResult(raw, backend)
+		require.False(t, ok)
+		require.Nil(t, out)
 	})
 }
 

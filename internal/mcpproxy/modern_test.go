@@ -1383,9 +1383,26 @@ func (r *concurrentRecorder) bodyString() string {
 func TestHandleSubscriptionsListen_MergesAndRewritesEvents(t *testing.T) {
 	// Each backend emits one resources/updated notification with an upstream URI;
 	// the gateway must re-prefix each URI into the downstream namespace and forward
-	// all events to the single client SSE stream.
+	// only events matching the client's namespaced subscriptions. Backends must
+	// receive bare (unprefixed) URIs for their own resources only.
+	var mu sync.Mutex
+	gotUpstream := map[string][]string{} // backend -> resourceSubscriptions seen
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		backend := r.Header.Get(internalapi.MCPBackendHeader)
+		body, _ := io.ReadAll(r.Body)
+		var envelope struct {
+			Params struct {
+				Notifications struct {
+					ResourceSubscriptions []string `json:"resourceSubscriptions"`
+				} `json:"notifications"`
+			} `json:"params"`
+		}
+		_ = json.Unmarshal(body, &envelope)
+		mu.Lock()
+		gotUpstream[backend] = append([]string(nil), envelope.Params.Notifications.ResourceSubscriptions...)
+		mu.Unlock()
+
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		notif := fmt.Sprintf(`{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"file:///watched-%s"}}`, backend)
@@ -1404,7 +1421,15 @@ func TestHandleSubscriptionsListen_MergesAndRewritesEvents(t *testing.T) {
 
 	r := newModernRequest("subscriptions/listen").WithContext(ctx)
 	rr := &concurrentRecorder{ResponseRecorder: httptest.NewRecorder()}
-	req := modernReq(t, "subscriptions/listen", []byte(`{"notifications":{"resourceSubscriptions":["file:///watched-backend1"]}}`))
+	sub1 := downstreamResourceURI("file:///watched-backend1", "backend1")
+	sub2 := downstreamResourceURI("file:///watched-backend2", "backend2")
+	params, err := json.Marshal(map[string]any{
+		"notifications": map[string]any{
+			"resourceSubscriptions": []string{sub1, sub2},
+		},
+	})
+	require.NoError(t, err)
+	req := modernReq(t, "subscriptions/listen", params)
 
 	done := make(chan struct{})
 	go func() {
@@ -1415,14 +1440,262 @@ func TestHandleSubscriptionsListen_MergesAndRewritesEvents(t *testing.T) {
 	// Poll a mutex-protected body snapshot; the handler writes concurrently.
 	require.Eventually(t, func() bool {
 		body := rr.bodyString()
-		return strings.Contains(body, downstreamResourceURI("file:///watched-backend1", "backend1")) &&
-			strings.Contains(body, downstreamResourceURI("file:///watched-backend2", "backend2"))
+		return strings.Contains(body, sub1) && strings.Contains(body, sub2)
 	}, time.Second, 10*time.Millisecond)
 	cancel()
 	<-done
 
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []string{"file:///watched-backend1"}, gotUpstream["backend1"],
+		"backend1 must receive the bare upstream URI only")
+	require.Equal(t, []string{"file:///watched-backend2"}, gotUpstream["backend2"],
+		"backend2 must receive the bare upstream URI only")
 	require.True(t, proxy.perBackendMetricsRecorded)
 	require.Equal(t, "text/event-stream", rr.Header().Get("Content-Type"))
+}
+
+func TestHandleSubscriptionsListen_OnlyContactsOwningBackend(t *testing.T) {
+	var mu sync.Mutex
+	contacted := map[string]int{}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backend := r.Header.Get(internalapi.MCPBackendHeader)
+		mu.Lock()
+		contacted[backend]++
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		// Emit an update for this backend's resource plus a list_changed the
+		// client did not opt into — only the subscribed resource update for
+		// backend1 should reach the client.
+		updated := fmt.Sprintf(
+			`{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"file:///watched-%s"}}`,
+			backend)
+		listChanged := `{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{}}`
+		_, _ = w.Write([]byte("event: message\ndata: " + updated + "\n\n"))
+		_, _ = w.Write([]byte("event: message\ndata: " + listChanged + "\n\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer server.Close()
+
+	proxy := newTestMCPProxy()
+	proxy.backendListenerAddr = server.URL
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	sub1 := downstreamResourceURI("file:///watched-backend1", "backend1")
+	params, err := json.Marshal(map[string]any{
+		"notifications": map[string]any{
+			"resourceSubscriptions": []string{sub1},
+		},
+	})
+	require.NoError(t, err)
+
+	r := newModernRequest("subscriptions/listen").WithContext(ctx)
+	rr := &concurrentRecorder{ResponseRecorder: httptest.NewRecorder()}
+	req := modernReq(t, "subscriptions/listen", params)
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = proxy.handleSubscriptionsListen(ctx, rr, r, req, "test-route", nil)
+		close(done)
+	}()
+
+	require.Eventually(t, func() bool {
+		return strings.Contains(rr.bodyString(), sub1)
+	}, time.Second, 10*time.Millisecond)
+	// Give any stray backend2 contact a moment to show up before asserting.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, 1, contacted["backend1"])
+	require.Zero(t, contacted["backend2"], "backend2 must not be contacted when no URI or list_changed targets it")
+	require.NotContains(t, rr.bodyString(), "list_changed",
+		"tools/list_changed must be filtered when the client did not opt in")
+	require.NotContains(t, rr.bodyString(), downstreamResourceURI("file:///watched-backend2", "backend2"))
+}
+
+func TestHandleSubscriptionsListen_RejectsBareResourceURI(t *testing.T) {
+	proxy := newTestMCPProxy()
+	rr := httptest.NewRecorder()
+	req := modernReq(t, "subscriptions/listen", []byte(`{"notifications":{"resourceSubscriptions":["file:///watched-backend1"]}}`))
+
+	_, err := proxy.handleSubscriptionsListen(context.Background(), rr, newModernRequest("subscriptions/listen"), req, "test-route", nil)
+	require.Error(t, err)
+	require.Equal(t, http.StatusBadRequest, rr.Code)
+	require.Contains(t, rr.Body.String(), "invalid resource subscription URI")
+}
+
+func TestHandleSubscriptionsListen_GracefulClosure(t *testing.T) {
+	// Backends send notifications then close their streams. The gateway must
+	// forward notifications and, once all backends are done, write a
+	// graceful completion result (resultType:"complete") per the spec.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backend := r.Header.Get(internalapi.MCPBackendHeader)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		notif := fmt.Sprintf(`{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"file:///watched-%s"}}`, backend)
+		_, _ = w.Write([]byte("event: message\ndata: " + notif + "\n\n"))
+		// Backend sends its own graceful completion and closes.
+		completion := `{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete"}}`
+		_, _ = w.Write([]byte("event: message\ndata: " + completion + "\n\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer server.Close()
+
+	proxy := newTestMCPProxy()
+	proxy.backendListenerAddr = server.URL
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	sub1 := downstreamResourceURI("file:///watched-backend1", "backend1")
+	sub2 := downstreamResourceURI("file:///watched-backend2", "backend2")
+	params, err := json.Marshal(map[string]any{
+		"notifications": map[string]any{
+			"resourceSubscriptions": []string{sub1, sub2},
+		},
+	})
+	require.NoError(t, err)
+
+	r := newModernRequest("subscriptions/listen").WithContext(ctx)
+	rr := &concurrentRecorder{ResponseRecorder: httptest.NewRecorder()}
+	req := modernReq(t, "subscriptions/listen", params)
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = proxy.handleSubscriptionsListen(ctx, rr, r, req, "test-route", nil)
+		close(done)
+	}()
+
+	// Wait for handler to finish (backends close, gateway writes completion).
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for handler to finish")
+	}
+
+	body := rr.bodyString()
+	// Notification URIs were re-prefixed.
+	require.Contains(t, body, sub1)
+	require.Contains(t, body, sub2)
+	// Gateway wrote its own graceful completion result.
+	require.Contains(t, body, `"resultType":"complete"`)
+	// Backend completion results were NOT forwarded (gateway synthesizes its own).
+	// Count occurrences of "resultType" — should be exactly 1 (gateway's).
+	require.Equal(t, 1, strings.Count(body, `"resultType"`),
+		"only the gateway's completion result should appear, not backend completions")
+}
+
+func TestHandleSubscriptionsListen_ForwardsCancelled(t *testing.T) {
+	// When a backend sends notifications/cancelled (server-initiated teardown),
+	// the gateway must forward it to the client.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		cancelled := `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"1","reason":"server shutdown"}}`
+		_, _ = w.Write([]byte("event: message\ndata: " + cancelled + "\n\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer server.Close()
+
+	proxy := newTestMCPProxy()
+	proxy.backendListenerAddr = server.URL
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	r := newModernRequest("subscriptions/listen").WithContext(ctx)
+	rr := &concurrentRecorder{ResponseRecorder: httptest.NewRecorder()}
+	params, err := json.Marshal(map[string]any{
+		"notifications": map[string]any{
+			"toolsListChanged": true,
+		},
+	})
+	require.NoError(t, err)
+	req := modernReq(t, "subscriptions/listen", params)
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = proxy.handleSubscriptionsListen(ctx, rr, r, req, "test-route", nil)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for handler to finish")
+	}
+
+	body := rr.bodyString()
+	require.Contains(t, body, "notifications/cancelled")
+	require.Contains(t, body, "server shutdown")
+}
+
+func TestRewriteAcknowledgedSubscriptions(t *testing.T) {
+	t.Run("re-prefixes resourceSubscriptions", func(t *testing.T) {
+		in := json.RawMessage(`{"notifications":{"resourceSubscriptions":["file:///a","file:///b"],"toolsListChanged":true}}`)
+		out, ok := rewriteAcknowledgedSubscriptions(in, "backend1")
+		require.True(t, ok)
+		var m map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(out, &m))
+		var notifs map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(m["notifications"], &notifs))
+		var uris []string
+		require.NoError(t, json.Unmarshal(notifs["resourceSubscriptions"], &uris))
+		require.Equal(t, []string{
+			downstreamResourceURI("file:///a", "backend1"),
+			downstreamResourceURI("file:///b", "backend1"),
+		}, uris)
+		require.Equal(t, json.RawMessage(`true`), notifs["toolsListChanged"])
+	})
+
+	t.Run("empty params", func(t *testing.T) {
+		out, ok := rewriteAcknowledgedSubscriptions(nil, "backend1")
+		require.False(t, ok)
+		require.Nil(t, out)
+	})
+
+	t.Run("missing notifications", func(t *testing.T) {
+		out, ok := rewriteAcknowledgedSubscriptions(json.RawMessage(`{}`), "backend1")
+		require.False(t, ok)
+		require.Nil(t, out)
+	})
+}
+
+func TestPartitionResourceSubscriptions(t *testing.T) {
+	notifs := &mcp.NotificationSubscriptions{
+		ToolsListChanged: true,
+		ResourceSubscriptions: []string{
+			downstreamResourceURI("file:///a", "backend1"),
+			downstreamResourceURI("file:///b", "backend2"),
+			downstreamResourceURI("file:///c", "backend1"),
+		},
+	}
+	intent, perBackend, err := partitionResourceSubscriptions(notifs)
+	require.NoError(t, err)
+	require.True(t, intent.toolsListChanged)
+	require.False(t, intent.promptsListChanged)
+	require.Len(t, intent.resourceURIs, 3)
+	require.Equal(t, []string{"file:///a", "file:///c"}, perBackend["backend1"])
+	require.Equal(t, []string{"file:///b"}, perBackend["backend2"])
+
+	_, _, err = partitionResourceSubscriptions(&mcp.NotificationSubscriptions{
+		ResourceSubscriptions: []string{"file:///bare"},
+	})
+	require.Error(t, err)
 }
 
 // cmpOr returns the first non-empty string, a tiny local helper for tests.
@@ -2053,35 +2326,32 @@ func TestHandleModernToolsCall_BackendExcludedBySelector(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 func TestRewriteToolsCallResult(t *testing.T) {
-	l := slog.Default()
-
 	t.Run("input_required passes through verbatim", func(t *testing.T) {
 		// Interim MRTR results must not be rewritten so the state survives.
 		in := json.RawMessage(`{"resultType":"input_required","inputRequests":{"q":{"type":"text"}}}`)
-		out, ok := rewriteToolsCallResult(in, "backend1", l)
+		out, ok := rewriteToolsCallResult(in, "backend1")
 		require.False(t, ok)
 		require.Nil(t, out)
 	})
 
 	t.Run("inputRequests without resultType passes through", func(t *testing.T) {
 		in := json.RawMessage(`{"inputRequests":{"q":{"type":"text"}}}`)
-		out, ok := rewriteToolsCallResult(in, "backend1", l)
+		out, ok := rewriteToolsCallResult(in, "backend1")
 		require.False(t, ok)
 		require.Nil(t, out)
 	})
 
 	t.Run("non-standard result shape passes through", func(t *testing.T) {
-		// A result that does not unmarshal into a CallToolResult is owned by the
-		// backend and must pass through unchanged.
+		// A result whose content is not an array has no rewritable URIs; pass through.
 		in := json.RawMessage(`{"content":"not-an-array"}`)
-		out, ok := rewriteToolsCallResult(in, "backend1", l)
+		out, ok := rewriteToolsCallResult(in, "backend1")
 		require.False(t, ok)
 		require.Nil(t, out)
 	})
 
 	t.Run("result with no URIs is left untouched", func(t *testing.T) {
 		in := json.RawMessage(`{"content":[{"type":"text","text":"hi"}]}`)
-		out, ok := rewriteToolsCallResult(in, "backend1", l)
+		out, ok := rewriteToolsCallResult(in, "backend1")
 		require.False(t, ok, "no URIs to rewrite")
 		require.Nil(t, out)
 	})
@@ -2091,7 +2361,7 @@ func TestRewriteToolsCallResult(t *testing.T) {
 			Content: []mcp.Content{&mcp.ResourceLink{URI: "file:///data"}},
 		})
 		require.NoError(t, err)
-		out, ok := rewriteToolsCallResult(link, "backend1", l)
+		out, ok := rewriteToolsCallResult(link, "backend1")
 		require.True(t, ok)
 
 		var result mcp.CallToolResult
@@ -2100,6 +2370,49 @@ func TestRewriteToolsCallResult(t *testing.T) {
 		rl, isLink := result.Content[0].(*mcp.ResourceLink)
 		require.True(t, isLink)
 		require.Equal(t, downstreamResourceURI("file:///data", "backend1"), rl.URI)
+	})
+
+	t.Run("unknown fields and _meta extras are preserved", func(t *testing.T) {
+		// Round-tripping through mcp.CallToolResult would drop ttlMs and the
+		// unknown _meta key; the raw-map rewrite must keep them.
+		in := json.RawMessage(`{
+			"content":[{"type":"resource_link","uri":"file:///data","name":"data"}],
+			"ttlMs":1000,
+			"_meta":{"ui":{"resourceUri":"ui://app/view"},"customKey":"keep-me"}
+		}`)
+		out, ok := rewriteToolsCallResult(in, "backend1")
+		require.True(t, ok)
+
+		var m map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(out, &m))
+		require.Equal(t, json.RawMessage(`1000`), m["ttlMs"])
+
+		var meta map[string]any
+		require.NoError(t, json.Unmarshal(m["_meta"], &meta))
+		require.Equal(t, "keep-me", meta["customKey"])
+		ui, ok := meta["ui"].(map[string]any)
+		require.True(t, ok)
+		require.Equal(t, downstreamResourceURI("ui://app/view", "backend1"), ui["resourceUri"])
+
+		var contents []map[string]any
+		require.NoError(t, json.Unmarshal(m["content"], &contents))
+		require.Len(t, contents, 1)
+		require.Equal(t, downstreamResourceURI("file:///data", "backend1"), contents[0]["uri"])
+	})
+
+	t.Run("embedded resource uri is re-prefixed", func(t *testing.T) {
+		in := json.RawMessage(`{"content":[{"type":"resource","resource":{"uri":"file:///blob","text":"x"}}]}`)
+		out, ok := rewriteToolsCallResult(in, "backend1")
+		require.True(t, ok)
+		var m map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(out, &m))
+		var contents []map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(m["content"], &contents))
+		var resource map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(contents[0]["resource"], &resource))
+		var uri string
+		require.NoError(t, json.Unmarshal(resource["uri"], &uri))
+		require.Equal(t, downstreamResourceURI("file:///blob", "backend1"), uri)
 	})
 }
 
