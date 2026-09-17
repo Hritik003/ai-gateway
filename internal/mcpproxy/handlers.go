@@ -50,38 +50,54 @@ type postCompletion struct {
 	session *session
 }
 
-// httpStatusToJSONRPCCode maps an HTTP status to a reasonable JSON-RPC error
-// code so every gateway error is a parseable JSON-RPC error object.
-func httpStatusToJSONRPCCode(status int) int {
-	switch status {
-	case http.StatusNotFound:
-		return errCodeMethodNotFound // -32601
-	case http.StatusBadRequest:
-		return errCodeInvalidRequest // -32600
-	case http.StatusForbidden:
-		return errCodeInvalidRequest // -32600
-	case http.StatusUnauthorized:
-		return errCodeInvalidRequest // -32600
-	case http.StatusRequestEntityTooLarge:
-		return errCodeInvalidRequest // -32600
-	default:
-		return -32603 // internal error
-	}
+// onErrorResponse writes a JSON-RPC error response when no request ID is
+// available (pre-parse failures, body-too-large, etc.). The id is null per
+// JSON-RPC 2.0 §5.1: "If there was an error in detecting the id in the
+// Request object, it MUST be Null."
+func onErrorResponse(w http.ResponseWriter, status int, msg string) {
+	writeJSONRPCError(w, status, errCodeFromStatus(status), msg, nil)
 }
 
-func onErrorResponse(w http.ResponseWriter, status int, msg string) {
+// onRequestError writes a JSON-RPC error response echoing the request's id.
+// Use this instead of onErrorResponse whenever the parsed request is available.
+func onRequestError(w http.ResponseWriter, status int, code int, msg string, id jsonrpc.ID) {
+	writeJSONRPCError(w, status, code, msg, &id)
+}
+
+func writeJSONRPCError(w http.ResponseWriter, status, code int, msg string, id *jsonrpc.ID) {
 	resp := map[string]any{
 		"jsonrpc": "2.0",
-		"id":      nil,
 		"error": map[string]any{
-			"code":    httpStatusToJSONRPCCode(status),
+			"code":    code,
 			"message": msg,
 		},
+	}
+	if id != nil && id.IsValid() {
+		resp["id"] = id.Raw()
+	} else {
+		resp["id"] = nil
 	}
 	encoded, _ := json.Marshal(resp)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(encoded)
+}
+
+// errCodeFromStatus maps an HTTP status to a JSON-RPC error code for callers
+// that only have a status (onErrorResponse / legacy path). Prefer an explicit
+// code via onRequestError when the condition is known.
+func errCodeFromStatus(status int) int {
+	switch status {
+	case http.StatusNotFound:
+		return errCodeMethodNotFound // -32601
+	case http.StatusBadRequest, http.StatusForbidden, http.StatusUnauthorized, http.StatusRequestEntityTooLarge:
+		return errCodeInvalidRequest // -32600
+	default:
+		if status >= 500 {
+			return -32603 // internal error
+		}
+		return errCodeInvalidRequest
+	}
 }
 
 // writeProtocolError writes a protocolError as a structured JSON-RPC error

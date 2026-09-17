@@ -102,7 +102,7 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 		m.l.Error("missing route header on modern request")
 		errType = metrics.MCPErrorInternal
 		err = errors.New("missing route header")
-		onErrorResponse(w, http.StatusInternalServerError, "missing route header")
+		onRequestError(w, http.StatusInternalServerError, -32603, "missing route header", req.ID)
 		return
 	}
 
@@ -110,8 +110,7 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 	if headerMethod != req.Method {
 		errType = metrics.MCPErrorInvalidJSONRPC
 		err = fmt.Errorf("Mcp-Method header mismatch")
-		onErrorResponse(w, http.StatusBadRequest,
-			fmt.Sprintf("Mcp-Method header '%s' does not match body method '%s'", headerMethod, req.Method))
+		onRequestError(w, http.StatusBadRequest, errCodeHeaderMismatch, fmt.Sprintf("Mcp-Method header '%s' does not match body method '%s'", headerMethod, req.Method), req.ID)
 		return
 	}
 
@@ -119,17 +118,17 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 	case "initialize", "notifications/initialized":
 		errType = metrics.MCPErrorUnsupportedMethod
 		err = fmt.Errorf("method removed in 2026-07-28: %s", req.Method)
-		onErrorResponse(w, http.StatusNotFound, "method removed in 2026-07-28: use server/discover")
+		onRequestError(w, http.StatusNotFound, errCodeMethodNotFound, "method removed in 2026-07-28: use server/discover", req.ID)
 		return
 	case "ping":
 		errType = metrics.MCPErrorUnsupportedMethod
 		err = errors.New("ping removed in 2026-07-28")
-		onErrorResponse(w, http.StatusNotFound, "ping removed in 2026-07-28")
+		onRequestError(w, http.StatusNotFound, errCodeMethodNotFound, "ping removed in 2026-07-28", req.ID)
 		return
 	case "logging/setLevel":
 		errType = metrics.MCPErrorUnsupportedMethod
 		err = errors.New("logging/setLevel removed in 2026-07-28")
-		onErrorResponse(w, http.StatusNotFound, "logging/setLevel removed in 2026-07-28; use _meta logLevel")
+		onRequestError(w, http.StatusNotFound, errCodeMethodNotFound, "logging/setLevel removed in 2026-07-28; use _meta logLevel", req.ID)
 		return
 	}
 
@@ -148,7 +147,7 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 		span, err = parseParamsAndMaybeStartSpan(ctx, m, req, p, r.Header)
 		if err != nil {
 			errType = metrics.MCPErrorInvalidParam
-			onErrorResponse(w, http.StatusBadRequest, "invalid params")
+			onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, "invalid params", req.ID)
 			return
 		}
 		params = p
@@ -158,7 +157,7 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 		span, err = parseParamsAndMaybeStartSpan(ctx, m, req, p, r.Header)
 		if err != nil {
 			errType = metrics.MCPErrorInvalidParam
-			onErrorResponse(w, http.StatusBadRequest, "invalid params")
+			onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, "invalid params", req.ID)
 			return
 		}
 		params = p
@@ -168,7 +167,7 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 		span, err = parseParamsAndMaybeStartSpan(ctx, m, req, p, r.Header)
 		if err != nil {
 			errType = metrics.MCPErrorInvalidParam
-			onErrorResponse(w, http.StatusBadRequest, "invalid params")
+			onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, "invalid params", req.ID)
 			return
 		}
 		params = p
@@ -178,7 +177,7 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 		span, err = parseParamsAndMaybeStartSpan(ctx, m, req, p, r.Header)
 		if err != nil {
 			errType = metrics.MCPErrorInvalidParam
-			onErrorResponse(w, http.StatusBadRequest, "invalid params")
+			onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, "invalid params", req.ID)
 			return
 		}
 		params = p
@@ -188,7 +187,7 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 		span, err = parseParamsAndMaybeStartSpan(ctx, m, req, p, r.Header)
 		if err != nil {
 			errType = metrics.MCPErrorInvalidParam
-			onErrorResponse(w, http.StatusBadRequest, "invalid params")
+			onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, "invalid params", req.ID)
 			return
 		}
 		params = p
@@ -198,7 +197,7 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 		span, err = parseParamsAndMaybeStartSpan(ctx, m, req, p, r.Header)
 		if err != nil {
 			errType = metrics.MCPErrorInvalidParam
-			onErrorResponse(w, http.StatusBadRequest, "invalid params")
+			onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, "invalid params", req.ID)
 			return
 		}
 		params = p
@@ -208,7 +207,7 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 		span, err = parseParamsAndMaybeStartSpan(ctx, m, req, p, r.Header)
 		if err != nil {
 			errType = metrics.MCPErrorInvalidParam
-			onErrorResponse(w, http.StatusBadRequest, "invalid params")
+			onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, "invalid params", req.ID)
 			return
 		}
 		params = p
@@ -218,7 +217,7 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 		span, err = parseParamsAndMaybeStartSpan(ctx, m, req, p, r.Header)
 		if err != nil {
 			errType = metrics.MCPErrorInvalidParam
-			onErrorResponse(w, http.StatusBadRequest, "invalid params")
+			onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, "invalid params", req.ID)
 			return
 		}
 		params = p
@@ -228,7 +227,7 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 		span, err = parseParamsAndMaybeStartSpan(ctx, m, req, p, r.Header)
 		if err != nil {
 			errType = metrics.MCPErrorInvalidParam
-			onErrorResponse(w, http.StatusBadRequest, "invalid params")
+			onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, "invalid params", req.ID)
 			return
 		}
 		params = p
@@ -238,7 +237,7 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 		span, err = parseParamsAndMaybeStartSpan(ctx, m, req, p, r.Header)
 		if err != nil {
 			errType = metrics.MCPErrorInvalidParam
-			onErrorResponse(w, http.StatusBadRequest, "invalid params")
+			onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, "invalid params", req.ID)
 			return
 		}
 		params = p
@@ -255,7 +254,7 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 		}
 		errType = metrics.MCPErrorUnsupportedMethod
 		err = fmt.Errorf("unknown method: %s", req.Method)
-		onErrorResponse(w, http.StatusNotFound, fmt.Sprintf("unknown method: %s", req.Method))
+		onRequestError(w, http.StatusNotFound, errCodeMethodNotFound, fmt.Sprintf("unknown method: %s", req.Method), req.ID)
 		return
 	}
 	if errType == "" {
@@ -271,10 +270,10 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 // Header extraction matches newSession: route-level forwardHeaders are read
 // before backendSelector, then per-backend ForwardHeaders are read for the
 // selected set only.
-func (m *mcpRequestContext) resolveModernRouteBackends(w http.ResponseWriter, route filterapi.MCPRouteName) (*mcpProxyConfigRoute, map[filterapi.MCPBackendName]filterapi.MCPBackend, error) {
+func (m *mcpRequestContext) resolveModernRouteBackends(w http.ResponseWriter, route filterapi.MCPRouteName, id jsonrpc.ID) (*mcpProxyConfigRoute, map[filterapi.MCPBackendName]filterapi.MCPBackend, error) {
 	routeConfig, ok := m.routes[route]
 	if !ok {
-		onErrorResponse(w, http.StatusNotFound, "route not found")
+		onRequestError(w, http.StatusNotFound, errCodeInvalidParams, "route not found", id)
 		return nil, nil, fmt.Errorf("%w: %s", errBackendNotFound, route)
 	}
 
@@ -284,7 +283,7 @@ func (m *mcpRequestContext) resolveModernRouteBackends(w http.ResponseWriter, ro
 	// 2. select authorized backends
 	selected, err := m.selectAuthorizedBackends(route, routeConfig)
 	if err != nil {
-		onErrorResponse(w, http.StatusForbidden, "access denied")
+		onRequestError(w, http.StatusForbidden, errCodeInvalidRequest, "access denied", id)
 		return nil, nil, err
 	}
 
@@ -297,15 +296,15 @@ func (m *mcpRequestContext) resolveModernRouteBackends(w http.ResponseWriter, ro
 // lookupSelectedBackend returns the named backend from the already-selected
 // set produced by resolveModernRouteBackends. Writes 403 if the backend is on
 // the route but excluded by backendSelector, or 404 if it is unknown.
-func lookupSelectedBackend(w http.ResponseWriter, routeConfig *mcpProxyConfigRoute, selected map[filterapi.MCPBackendName]filterapi.MCPBackend, backendName string) (filterapi.MCPBackend, error) {
+func lookupSelectedBackend(w http.ResponseWriter, routeConfig *mcpProxyConfigRoute, selected map[filterapi.MCPBackendName]filterapi.MCPBackend, backendName string, id jsonrpc.ID) (filterapi.MCPBackend, error) {
 	if backend, ok := selected[backendName]; ok {
 		return backend, nil
 	}
 	if _, onRoute := routeConfig.backends[backendName]; onRoute {
-		onErrorResponse(w, http.StatusForbidden, "access denied")
+		onRequestError(w, http.StatusForbidden, errCodeInvalidRequest, "access denied", id)
 		return filterapi.MCPBackend{}, errors.New("authorization failed")
 	}
-	onErrorResponse(w, http.StatusNotFound, fmt.Sprintf("unknown backend %s", backendName))
+	onRequestError(w, http.StatusNotFound, errCodeInvalidParams, fmt.Sprintf("unknown backend %s", backendName), id)
 	return filterapi.MCPBackend{}, fmt.Errorf("%w: %s", errBackendNotFound, backendName)
 }
 
@@ -316,7 +315,7 @@ func lookupSelectedBackend(w http.ResponseWriter, routeConfig *mcpProxyConfigRou
 // skipped.
 func (m *mcpRequestContext) handleServerDiscover(ctx context.Context, w http.ResponseWriter, req *jsonrpc.Request, route filterapi.MCPRouteName, span tracingapi.MCPSpan) (handlerResult, error) {
 	m.perBackendMetricsRecorded = true
-	_, selectedBackends, err := m.resolveModernRouteBackends(w, route)
+	_, selectedBackends, err := m.resolveModernRouteBackends(w, route, req.ID)
 	if err != nil {
 		return handlerResult{}, err
 	}
@@ -343,7 +342,7 @@ func (m *mcpRequestContext) handleServerDiscover(ctx context.Context, w http.Res
 	}
 	if len(results) == 0 {
 		m.l.Error("server/discover failed for all backends", slog.String("route", route))
-		onErrorResponse(w, http.StatusInternalServerError, "failed to discover any backend")
+		onRequestError(w, http.StatusInternalServerError, -32603, "failed to discover any backend", req.ID)
 		return handlerResult{}, errors.New("failed to discover any backend")
 	}
 	merged := mergeDiscoverResults(m.l, results)
@@ -436,14 +435,14 @@ func (m *mcpRequestContext) handleModernToolsList(ctx context.Context, w http.Re
 	// even when this handler is invoked directly (e.g. in tests) so auth stays enforced.
 	m.requestHeaders = r.Header
 
-	_, selected, err := m.resolveModernRouteBackends(w, route)
+	_, selected, err := m.resolveModernRouteBackends(w, route, req.ID)
 	if err != nil {
 		return handlerResult{}, err
 	}
 
 	responses, err := sendToAllModernBackendsAndAggregateResponses[mcp.ListToolsResult](ctx, m, req, route, selected, span)
 	if err != nil {
-		onErrorResponse(w, http.StatusInternalServerError, "failed to list tools for all backends")
+		onRequestError(w, http.StatusInternalServerError, -32603, "failed to list tools for all backends", req.ID)
 		return handlerResult{}, err
 	}
 	result := m.mergeToolsList(&session{route: route}, responses)
@@ -463,14 +462,14 @@ func (m *mcpRequestContext) handleModernResourcesList(ctx context.Context, w htt
 	m.perBackendMetricsRecorded = true
 	m.requestHeaders = r.Header
 
-	_, selected, err := m.resolveModernRouteBackends(w, route)
+	_, selected, err := m.resolveModernRouteBackends(w, route, req.ID)
 	if err != nil {
 		return handlerResult{}, err
 	}
 
 	responses, err := sendToAllModernBackendsAndAggregateResponses[mcp.ListResourcesResult](ctx, m, req, route, selected, span)
 	if err != nil {
-		onErrorResponse(w, http.StatusInternalServerError, "failed to list resources for all backends")
+		onRequestError(w, http.StatusInternalServerError, -32603, "failed to list resources for all backends", req.ID)
 		return handlerResult{}, err
 	}
 	result := m.mergeResourceList(&session{route: route}, responses)
@@ -489,13 +488,13 @@ func (m *mcpRequestContext) handleModernResourceTemplatesList(ctx context.Contex
 	m.perBackendMetricsRecorded = true
 	m.requestHeaders = r.Header
 
-	_, selected, err := m.resolveModernRouteBackends(w, route)
+	_, selected, err := m.resolveModernRouteBackends(w, route, req.ID)
 	if err != nil {
 		return handlerResult{}, err
 	}
 	responses, err := sendToAllModernBackendsAndAggregateResponses[mcp.ListResourceTemplatesResult](ctx, m, req, route, selected, span)
 	if err != nil {
-		onErrorResponse(w, http.StatusInternalServerError, "failed to list resource templates for all backends")
+		onRequestError(w, http.StatusInternalServerError, -32603, "failed to list resource templates for all backends", req.ID)
 		return handlerResult{}, err
 	}
 	result := m.mergeResourcesTemplateList(&session{route: route}, responses)
@@ -515,14 +514,14 @@ func (m *mcpRequestContext) handleModernPromptsList(ctx context.Context, w http.
 	m.perBackendMetricsRecorded = true
 	m.requestHeaders = r.Header
 
-	_, selected, err := m.resolveModernRouteBackends(w, route)
+	_, selected, err := m.resolveModernRouteBackends(w, route, req.ID)
 	if err != nil {
 		return handlerResult{}, err
 	}
 
 	responses, err := sendToAllModernBackendsAndAggregateResponses[mcp.ListPromptsResult](ctx, m, req, route, selected, span)
 	if err != nil {
-		onErrorResponse(w, http.StatusInternalServerError, "failed to list prompts for all backends")
+		onRequestError(w, http.StatusInternalServerError, -32603, "failed to list prompts for all backends", req.ID)
 		return handlerResult{}, err
 	}
 	result := m.mergePromptsList(&session{route: route}, responses)
@@ -539,7 +538,7 @@ func (m *mcpRequestContext) handleModernPromptsList(ctx context.Context, w http.
 func (m *mcpRequestContext) handleModernToolsCall(ctx context.Context, w http.ResponseWriter, r *http.Request, req *jsonrpc.Request, route filterapi.MCPRouteName, span tracingapi.MCPSpan) (handlerResult, error) {
 	m.requestHeaders = r.Header
 
-	routeConfig, selected, err := m.resolveModernRouteBackends(w, route)
+	routeConfig, selected, err := m.resolveModernRouteBackends(w, route, req.ID)
 	if err != nil {
 		return handlerResult{}, err
 	}
@@ -547,7 +546,7 @@ func (m *mcpRequestContext) handleModernToolsCall(ctx context.Context, w http.Re
 	// Extract tool name from params.
 	var params mcp.CallToolParams
 	if err = json.Unmarshal(req.Params, &params); err != nil {
-		onErrorResponse(w, http.StatusBadRequest, "invalid tools/call params")
+		onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, "invalid tools/call params", req.ID)
 		return handlerResult{}, fmt.Errorf("invalid tools/call params: %w", &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: err.Error()})
 	}
 
@@ -565,20 +564,20 @@ func (m *mcpRequestContext) handleModernToolsCall(ctx context.Context, w http.Re
 	if !resolvedFromIndex {
 		backendName, upstreamName, err = upstreamResourceName(params.Name)
 		if err != nil {
-			onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid tool name: %v", err))
+			onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, fmt.Sprintf("invalid tool name: %v", err), req.ID)
 			return handlerResult{}, fmt.Errorf("%w: %s", errInvalidToolName, params.Name)
 		}
 	}
 	result := handlerResult{backendName: backendName}
 
-	backend, err := lookupSelectedBackend(w, routeConfig, selected, backendName)
+	backend, err := lookupSelectedBackend(w, routeConfig, selected, backendName, req.ID)
 	if err != nil {
 		return result, err
 	}
 
 	// Enforce per-route tool selector filters.
 	if selector := routeConfig.toolSelectors[backendName]; selector != nil && !selector.allows(upstreamName) {
-		onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid tool name: %s", upstreamName))
+		onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, fmt.Sprintf("invalid tool name: %s", upstreamName), req.ID)
 		return result, fmt.Errorf("%w: %s", errInvalidToolName, upstreamName)
 	}
 
@@ -605,7 +604,7 @@ func (m *mcpRequestContext) handleModernToolsCall(ctx context.Context, w http.Re
 					w.Header().Set("WWW-Authenticate", challenge)
 				}
 			}
-			onErrorResponse(w, http.StatusForbidden, "access denied")
+			onRequestError(w, http.StatusForbidden, errCodeInvalidRequest, "access denied", req.ID)
 			return result, errors.New("authorization failed")
 		}
 	}
@@ -614,7 +613,7 @@ func (m *mcpRequestContext) handleModernToolsCall(ctx context.Context, w http.Re
 	params.Name = upstreamName
 	rewrittenParams, err := json.Marshal(params)
 	if err != nil {
-		onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid tools/call params: %v", err))
+		onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, fmt.Sprintf("invalid tools/call params: %v", err), req.ID)
 		return result, fmt.Errorf("invalid tools/call params: %w", err)
 	}
 	req.Params = rewrittenParams
@@ -633,25 +632,25 @@ func (m *mcpRequestContext) handleModernToolsCall(ctx context.Context, w http.Re
 func (m *mcpRequestContext) handleModernResourcesRead(ctx context.Context, w http.ResponseWriter, r *http.Request, req *jsonrpc.Request, route filterapi.MCPRouteName, span tracingapi.MCPSpan) (handlerResult, error) {
 	m.requestHeaders = r.Header
 
-	routeConfig, selected, err := m.resolveModernRouteBackends(w, route)
+	routeConfig, selected, err := m.resolveModernRouteBackends(w, route, req.ID)
 	if err != nil {
 		return handlerResult{}, err
 	}
 
 	var params mcp.ReadResourceParams
 	if err = json.Unmarshal(req.Params, &params); err != nil {
-		onErrorResponse(w, http.StatusBadRequest, "invalid resources/read params")
+		onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, "invalid resources/read params", req.ID)
 		return handlerResult{}, fmt.Errorf("invalid resources/read params: %w", &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: err.Error()})
 	}
 
 	backendName, upstreamURI, err := upstreamResourceURI(params.URI)
 	if err != nil {
-		onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid resource URI: %v", err))
+		onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, fmt.Sprintf("invalid resource URI: %v", err), req.ID)
 		return handlerResult{}, fmt.Errorf("%w: %s", errInvalidToolName, params.URI)
 	}
 	result := handlerResult{backendName: backendName}
 
-	backend, err := lookupSelectedBackend(w, routeConfig, selected, backendName)
+	backend, err := lookupSelectedBackend(w, routeConfig, selected, backendName, req.ID)
 	if err != nil {
 		return result, err
 	}
@@ -659,7 +658,7 @@ func (m *mcpRequestContext) handleModernResourcesRead(ctx context.Context, w htt
 	params.URI = upstreamURI
 	rewrittenParams, err := json.Marshal(params)
 	if err != nil {
-		onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid resources/read params: %v", err))
+		onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, fmt.Sprintf("invalid resources/read params: %v", err), req.ID)
 		return result, fmt.Errorf("invalid resources/read params: %w", err)
 	}
 	req.Params = rewrittenParams
@@ -726,14 +725,14 @@ func rewriteResourcesReadResult(result json.RawMessage, backendName string) (jso
 func (m *mcpRequestContext) handleModernPromptsGet(ctx context.Context, w http.ResponseWriter, r *http.Request, req *jsonrpc.Request, route filterapi.MCPRouteName, span tracingapi.MCPSpan) (handlerResult, error) {
 	m.requestHeaders = r.Header
 
-	routeConfig, selected, err := m.resolveModernRouteBackends(w, route)
+	routeConfig, selected, err := m.resolveModernRouteBackends(w, route, req.ID)
 	if err != nil {
 		return handlerResult{}, err
 	}
 
 	var params mcp.GetPromptParams
 	if err = json.Unmarshal(req.Params, &params); err != nil {
-		onErrorResponse(w, http.StatusBadRequest, "invalid prompts/get params")
+		onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, "invalid prompts/get params", req.ID)
 		return handlerResult{}, fmt.Errorf("invalid prompts/get params: %w", &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: err.Error()})
 	}
 
@@ -742,26 +741,26 @@ func (m *mcpRequestContext) handleModernPromptsGet(ctx context.Context, w http.R
 	// resolvePromptBackend so both eras resolve names identically.
 	backendName, upstreamName, err := m.resolvePromptBackend(route, params.Name)
 	if err != nil {
-		onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid prompt name: %v", err))
+		onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, fmt.Sprintf("invalid prompt name: %v", err), req.ID)
 		return handlerResult{}, fmt.Errorf("%w: %s", errInvalidToolName, params.Name)
 	}
 	result := handlerResult{backendName: backendName}
 
-	backend, err := lookupSelectedBackend(w, routeConfig, selected, backendName)
+	backend, err := lookupSelectedBackend(w, routeConfig, selected, backendName, req.ID)
 	if err != nil {
 		return result, err
 	}
 
 	// Enforce per-route prompt selector filters (parity with the tools/call path).
 	if selector := routeConfig.promptSelectors[backendName]; selector != nil && !selector.allows(upstreamName) {
-		onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid prompt name: %s", upstreamName))
+		onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, fmt.Sprintf("invalid prompt name: %s", upstreamName), req.ID)
 		return result, fmt.Errorf("%w: %s", errInvalidToolName, upstreamName)
 	}
 
 	params.Name = upstreamName
 	rewrittenParams, err := json.Marshal(params)
 	if err != nil {
-		onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid prompts/get params: %v", err))
+		onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, fmt.Sprintf("invalid prompts/get params: %v", err), req.ID)
 		return result, fmt.Errorf("invalid prompts/get params: %w", err)
 	}
 	req.Params = rewrittenParams
@@ -773,18 +772,18 @@ func (m *mcpRequestContext) handleModernPromptsGet(ctx context.Context, w http.R
 func (m *mcpRequestContext) handleModernComplete(ctx context.Context, w http.ResponseWriter, r *http.Request, req *jsonrpc.Request, route filterapi.MCPRouteName, span tracingapi.MCPSpan) (handlerResult, error) {
 	m.requestHeaders = r.Header
 
-	routeConfig, selected, err := m.resolveModernRouteBackends(w, route)
+	routeConfig, selected, err := m.resolveModernRouteBackends(w, route, req.ID)
 	if err != nil {
 		return handlerResult{}, err
 	}
 
 	var params mcp.CompleteParams
 	if err = json.Unmarshal(req.Params, &params); err != nil {
-		onErrorResponse(w, http.StatusBadRequest, "invalid completion/complete params")
+		onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, "invalid completion/complete params", req.ID)
 		return handlerResult{}, fmt.Errorf("invalid completion/complete params: %w", &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: err.Error()})
 	}
 	if params.Ref == nil {
-		onErrorResponse(w, http.StatusBadRequest, "completion/complete requires a ref")
+		onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, "completion/complete requires a ref", req.ID)
 		return handlerResult{}, fmt.Errorf("%w: missing ref", errInvalidToolName)
 	}
 
@@ -800,16 +799,16 @@ func (m *mcpRequestContext) handleModernComplete(ctx context.Context, w http.Res
 	case "ref/resource":
 		backendName, params.Ref.URI, err = upstreamResourceURI(params.Ref.URI)
 	default:
-		onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("unsupported ref type: %s", params.Ref.Type))
+		onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, fmt.Sprintf("unsupported ref type: %s", params.Ref.Type), req.ID)
 		return handlerResult{}, fmt.Errorf("%w: unsupported ref type %s", errInvalidToolName, params.Ref.Type)
 	}
 	if err != nil {
-		onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid ref %s: %v", cmp.Or(params.Ref.Name, params.Ref.URI), err))
+		onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, fmt.Sprintf("invalid ref %s: %v", cmp.Or(params.Ref.Name, params.Ref.URI), err), req.ID)
 		return handlerResult{}, err
 	}
 	result := handlerResult{backendName: backendName}
 
-	backend, err := lookupSelectedBackend(w, routeConfig, selected, backendName)
+	backend, err := lookupSelectedBackend(w, routeConfig, selected, backendName, req.ID)
 	if err != nil {
 		return result, err
 	}
@@ -817,7 +816,7 @@ func (m *mcpRequestContext) handleModernComplete(ctx context.Context, w http.Res
 	// Rewrite params with the unprefixed ref.
 	rewrittenParams, err := json.Marshal(&params)
 	if err != nil {
-		onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid completion/complete params: %v", err))
+		onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, fmt.Sprintf("invalid completion/complete params: %v", err), req.ID)
 		return result, fmt.Errorf("invalid completion/complete params: %w", err)
 	}
 	req.Params = rewrittenParams
@@ -841,24 +840,24 @@ func (m *mcpRequestContext) handleSubscriptionsListen(ctx context.Context, w htt
 	m.perBackendMetricsRecorded = true
 	m.requestHeaders = r.Header
 
-	routeConfig, selected, err := m.resolveModernRouteBackends(w, route)
+	routeConfig, selected, err := m.resolveModernRouteBackends(w, route, req.ID)
 	if err != nil {
 		return handlerResult{}, err
 	}
 
 	var params mcp.SubscriptionsListenParams
 	if err = json.Unmarshal(req.Params, &params); err != nil {
-		onErrorResponse(w, http.StatusBadRequest, "invalid subscriptions/listen params")
+		onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, "invalid subscriptions/listen params", req.ID)
 		return handlerResult{}, fmt.Errorf("invalid subscriptions/listen params: %w", &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: err.Error()})
 	}
 
 	intent, perBackendURIs, err := partitionResourceSubscriptions(params.Notifications)
 	if err != nil {
-		onErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("invalid resource subscription URI: %v", err))
+		onRequestError(w, http.StatusBadRequest, errCodeInvalidParams, fmt.Sprintf("invalid resource subscription URI: %v", err), req.ID)
 		return handlerResult{}, err
 	}
 	for backendName := range perBackendURIs {
-		if _, err := lookupSelectedBackend(w, routeConfig, selected, backendName); err != nil {
+		if _, err := lookupSelectedBackend(w, routeConfig, selected, backendName, req.ID); err != nil {
 			return handlerResult{}, err
 		}
 	}
@@ -1307,7 +1306,7 @@ func (m *mcpRequestContext) sendModernRequestAndProxy(
 			writeBackendJSONRPCError(w, req.ID, bjErr.raw)
 			return result, err
 		}
-		onErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("call to %s failed: %v", backend.Name, err))
+		onRequestError(w, http.StatusInternalServerError, -32603, fmt.Sprintf("call to %s failed: %v", backend.Name, err), req.ID)
 		return result, err
 	}
 
