@@ -271,8 +271,10 @@ func TestOnError(t *testing.T) {
 	onErrorResponse(rr, http.StatusBadRequest, "test error")
 
 	require.Equal(t, http.StatusBadRequest, rr.Code)
-	require.Equal(t, "text/plain; charset=utf-8", rr.Header().Get("Content-Type"))
-	require.Equal(t, "test error", rr.Body.String())
+	require.Equal(t, "application/json", rr.Header().Get("Content-Type"))
+	require.Contains(t, rr.Body.String(), "test error")
+	require.Contains(t, rr.Body.String(), `"jsonrpc":"2.0"`)
+	require.Contains(t, rr.Body.String(), `"code":-32600`)
 }
 
 func Test_downstreamName(t *testing.T) {

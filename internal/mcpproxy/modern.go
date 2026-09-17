@@ -1140,12 +1140,24 @@ func rewriteAcknowledgedSubscriptions(params json.RawMessage, backendName string
 	if !ok {
 		return nil, false
 	}
+	// The spec says resourceSubscriptions should echo the URI array, but some
+	// backends (e.g. go-sdk) send a boolean true instead. Try the array first;
+	// if that fails, pass through whatever the backend sent so the notification
+	// is not silently dropped — the client can still branch on the other fields.
 	var uris []string
-	if json.Unmarshal(urisRaw, &uris) != nil {
-		return nil, false
-	}
-	if len(uris) == 0 {
-		return nil, false
+	if json.Unmarshal(urisRaw, &uris) != nil || len(uris) == 0 {
+		// Not a string array (boolean, null, empty) — no URIs to rewrite.
+		// Re-marshal the rest (other fields may have changed) and return.
+		notifsOut, err := json.Marshal(notifs)
+		if err != nil {
+			return nil, false
+		}
+		m["notifications"] = notifsOut
+		out, err := json.Marshal(m)
+		if err != nil {
+			return nil, false
+		}
+		return out, true
 	}
 	for i, uri := range uris {
 		uris[i] = downstreamResourceURI(uri, backendName)
