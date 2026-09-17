@@ -50,10 +50,38 @@ type postCompletion struct {
 	session *session
 }
 
+// httpStatusToJSONRPCCode maps an HTTP status to a reasonable JSON-RPC error
+// code so every gateway error is a parseable JSON-RPC error object.
+func httpStatusToJSONRPCCode(status int) int {
+	switch status {
+	case http.StatusNotFound:
+		return errCodeMethodNotFound // -32601
+	case http.StatusBadRequest:
+		return errCodeInvalidRequest // -32600
+	case http.StatusForbidden:
+		return errCodeInvalidRequest // -32600
+	case http.StatusUnauthorized:
+		return errCodeInvalidRequest // -32600
+	case http.StatusRequestEntityTooLarge:
+		return errCodeInvalidRequest // -32600
+	default:
+		return -32603 // internal error
+	}
+}
+
 func onErrorResponse(w http.ResponseWriter, status int, msg string) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	resp := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      nil,
+		"error": map[string]any{
+			"code":    httpStatusToJSONRPCCode(status),
+			"message": msg,
+		},
+	}
+	encoded, _ := json.Marshal(resp)
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_, _ = w.Write([]byte(msg))
+	_, _ = w.Write(encoded)
 }
 
 // writeProtocolError writes a protocolError as a structured JSON-RPC error

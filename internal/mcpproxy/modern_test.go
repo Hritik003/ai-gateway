@@ -426,7 +426,7 @@ func TestServeModernPOST_BackendSelectorDenied(t *testing.T) {
 	proxy.serveModernPOST(rr, r, req, time.Now())
 
 	require.Equal(t, http.StatusForbidden, rr.Code)
-	require.Equal(t, "access denied", rr.Body.String())
+	require.Contains(t, rr.Body.String(), "access denied")
 }
 
 // -----------------------------------------------------------------------------
@@ -2202,7 +2202,7 @@ func TestHandleModernToolsCall_AuthorizationDenied(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "authorization failed")
 	require.Equal(t, http.StatusForbidden, rr.Code)
-	require.Equal(t, "access denied", rr.Body.String())
+	require.Contains(t, rr.Body.String(), "access denied")
 	require.False(t, backendCalled, "backend must not be called when authorization is denied")
 }
 
@@ -2318,7 +2318,7 @@ func TestHandleModernToolsCall_BackendExcludedBySelector(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "authorization failed")
 	require.Equal(t, http.StatusForbidden, rr.Code)
-	require.Equal(t, "access denied", rr.Body.String())
+	require.Contains(t, rr.Body.String(), "access denied")
 }
 
 // -----------------------------------------------------------------------------
