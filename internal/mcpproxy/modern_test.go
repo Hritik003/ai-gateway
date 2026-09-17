@@ -79,6 +79,15 @@ func newModernRequest(method string) *http.Request {
 	return r
 }
 
+// mustID creates a jsonrpc.ID for test use; panics on failure.
+func mustID(v any) jsonrpc.ID {
+	id, err := jsonrpc.MakeID(v)
+	if err != nil {
+		panic(err)
+	}
+	return id
+}
+
 func modernReq(t *testing.T, method string, params []byte) *jsonrpc.Request {
 	t.Helper()
 	id, err := jsonrpc.MakeID("1")
@@ -945,7 +954,7 @@ func TestResolveModernRouteBackends_ExtractsForwardHeaders(t *testing.T) {
 	proxy.routes["test-route"].backends["backend2"] = b2
 
 	rr := httptest.NewRecorder()
-	_, selected, err := proxy.resolveModernRouteBackends(rr, "test-route")
+	_, selected, err := proxy.resolveModernRouteBackends(rr, "test-route", mustID("test"))
 	require.NoError(t, err)
 	require.Contains(t, selected, "backend1")
 	require.Contains(t, selected, "backend2")
@@ -983,7 +992,7 @@ func TestSendModernRequest_ForwardsPerBackendHeadersAfterResolve(t *testing.T) {
 	proxy.routes["test-route"].backends["backend1"] = b1
 
 	rr := httptest.NewRecorder()
-	_, _, err := proxy.resolveModernRouteBackends(rr, "test-route")
+	_, _, err := proxy.resolveModernRouteBackends(rr, "test-route", mustID("test"))
 	require.NoError(t, err)
 
 	req := modernReq(t, "tools/list", nil)
@@ -1010,7 +1019,7 @@ func TestResolveModernRouteBackends_PerBackendHeadersOnlyForSelected(t *testing.
 	proxy.routes["test-route"].backends["backend2"] = b2
 
 	rr := httptest.NewRecorder()
-	_, selected, err := proxy.resolveModernRouteBackends(rr, "test-route")
+	_, selected, err := proxy.resolveModernRouteBackends(rr, "test-route", mustID("test"))
 	require.NoError(t, err)
 	require.Equal(t, map[filterapi.MCPBackendName]filterapi.MCPBackend{"backend2": b2}, selected)
 	require.NotContains(t, proxy.perBackendExtraHeaders, "backend1")
