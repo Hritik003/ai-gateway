@@ -827,7 +827,7 @@ func TestSendModernRequest_JSONRPCError(t *testing.T) {
 
 	_, err := proxy.sendModernRequest(context.Background(), req, "test-route", proxy.routes["test-route"].backends["backend1"])
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "backend error")
+	require.Contains(t, err.Error(), "backend JSON-RPC error")
 }
 
 func TestSendModernRequest_NoResult(t *testing.T) {
