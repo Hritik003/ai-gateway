@@ -56,6 +56,33 @@ func onErrorResponse(w http.ResponseWriter, status int, msg string) {
 	_, _ = w.Write([]byte(msg))
 }
 
+// writeProtocolError writes a protocolError as a structured JSON-RPC error
+// response. The HTTP status comes from the protocolError itself (e.g. 400 for
+// modern validation failures, 200 for legacy JSON-RPC errors). requestID is
+// the client's JSON-RPC id; pass nil when no valid id was parsed.
+func writeProtocolError(w http.ResponseWriter, pe *protocolError, requestID *jsonrpc.ID) {
+	errObj := map[string]any{
+		"code":    pe.Code,
+		"message": pe.Message,
+	}
+	if pe.Data != nil {
+		errObj["data"] = pe.Data
+	}
+	resp := map[string]any{
+		"jsonrpc": "2.0",
+		"error":   errObj,
+	}
+	if requestID != nil && requestID.IsValid() {
+		resp["id"] = requestID.Raw()
+	} else {
+		resp["id"] = nil
+	}
+	encoded, _ := json.Marshal(resp)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(pe.HTTPStatus)
+	_, _ = w.Write(encoded)
+}
+
 // servePOST is the era-neutral entry point for MCP POST requests. It reads and
 // decodes the JSON-RPC message once, then dispatches to the modern stateless
 // path or the legacy path based on the era detected from the request.
@@ -108,7 +135,12 @@ func (m *mcpRequestContext) servePOST(w http.ResponseWriter, r *http.Request) {
 	// detect the client era and handle the request accordingly.
 	detection := detectClientEra(r, rawMsg)
 	if detection.err != nil {
-		onErrorResponse(w, detection.err.HTTPStatus, detection.err.Message)
+		// Extract the request ID (if any) so the JSON-RPC error carries it.
+		var requestID *jsonrpc.ID
+		if req, ok := rawMsg.(*jsonrpc.Request); ok && req != nil && req.ID.IsValid() {
+			requestID = &req.ID
+		}
+		writeProtocolError(w, detection.err, requestID)
 		return
 	}
 

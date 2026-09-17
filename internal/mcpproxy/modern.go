@@ -55,6 +55,13 @@ type subscriptionListenIntent struct {
 	resourcesListChanged bool
 }
 
+// backendJSONRPCError wraps a raw JSON-RPC error object returned by a backend.
+// It preserves the structured error so it can be forwarded to the client as-is
+// rather than being stringified into a text/plain 500 response.
+type backendJSONRPCError struct {
+	raw json.RawMessage
+}
+
 // serveModernPOST handles modern (2026-07-28) stateless POST requests.
 // This is the Phase 1 entry point for modern clients talking to modern backends.
 // The JSON-RPC request has already been parsed by servePOST.
@@ -237,6 +244,15 @@ func (m *mcpRequestContext) serveModernPOST(w http.ResponseWriter, r *http.Reque
 		params = p
 		result, err = m.handleModernComplete(ctx, w, r, req, route, span)
 	default:
+		// Client→server notifications are fire-and-forget: they carry no id and
+		// must never receive a response body. Accept them silently so the gateway
+		// doesn't reject valid notifications (e.g. notifications/progress) that
+		// it doesn't need to forward. Non-notification unknown methods are still
+		// rejected with 404.
+		if strings.HasPrefix(req.Method, "notifications/") && !req.ID.IsValid() {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
 		errType = metrics.MCPErrorUnsupportedMethod
 		err = fmt.Errorf("unknown method: %s", req.Method)
 		onErrorResponse(w, http.StatusNotFound, fmt.Sprintf("unknown method: %s", req.Method))
@@ -1271,6 +1287,14 @@ func (m *mcpRequestContext) sendModernRequestAndProxy(
 
 	resp, err := m.sendModernRequest(ctx, req, route, backend)
 	if err != nil {
+		// If the backend returned a structured JSON-RPC error, forward it to the
+		// client as a proper JSON-RPC error response instead of stringifying it
+		// into a text/plain 500.
+		var bjErr *backendJSONRPCError
+		if errors.As(err, &bjErr) {
+			writeBackendJSONRPCError(w, req.ID, bjErr.raw)
+			return result, err
+		}
 		onErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("call to %s failed: %v", backend.Name, err))
 		return result, err
 	}
@@ -1387,7 +1411,7 @@ func validateModernJSONRPCResponse(req *jsonrpc.Request, rpcResp map[string]json
 	case resultPresent && errorPresent:
 		return fmt.Errorf("backend response has both result and error")
 	case errorPresent:
-		return fmt.Errorf("backend error: %s", string(errField))
+		return &backendJSONRPCError{raw: errField}
 	case !resultPresent:
 		return fmt.Errorf("backend returned no result")
 	}
@@ -1586,4 +1610,23 @@ func (m *mcpRequestContext) applyForwardHeaders(httpReq *http.Request, route fil
 		perBackend = m.perBackendExtraHeaders[backend.Name]
 	}
 	applyExtractedForwardHeaders(httpReq, m.extraHeaders, perBackend)
+}
+
+func (e *backendJSONRPCError) Error() string {
+	return fmt.Sprintf("backend JSON-RPC error: %s", string(e.raw))
+}
+
+// writeBackendJSONRPCError writes a backend's JSON-RPC error as a proper
+// JSON-RPC error response to the client, preserving the original error code,
+// message, and data. The HTTP status is 200 so the JSON-RPC layer can parse it.
+func writeBackendJSONRPCError(w http.ResponseWriter, id jsonrpc.ID, raw json.RawMessage) {
+	resp := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id.Raw(),
+		"error":   raw,
+	}
+	encoded, _ := json.Marshal(resp)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(encoded)
 }
