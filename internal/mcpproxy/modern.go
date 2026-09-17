@@ -18,6 +18,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1077,7 +1078,7 @@ func (m *mcpRequestContext) forwardSubscriptionEvent(w io.Writer, event *sseEven
 					continue
 				}
 			case "notifications/subscriptions/acknowledged":
-				if rewritten, ok := rewriteAcknowledgedSubscriptions(json.RawMessage(v.Params), event.backend); ok {
+				if rewritten, ok := rewriteAcknowledgedSubscriptions(json.RawMessage(v.Params), event.backend, intent.resourceURIsForBackend(event.backend)); ok {
 					v.Params = []byte(rewritten)
 				}
 			case "notifications/cancelled":
@@ -1116,10 +1117,15 @@ func writeSSECompletionResult(w io.Writer, listenID jsonrpc.ID) {
 	_, _ = w.Write([]byte("\n\n"))
 }
 
-// rewriteAcknowledgedSubscriptions re-prefixes resourceSubscriptions URIs in a
-// notifications/subscriptions/acknowledged params payload so the client sees the
-// same gateway-namespaced URIs it requested.
-func rewriteAcknowledgedSubscriptions(params json.RawMessage, backendName string) (json.RawMessage, bool) {
+// rewriteAcknowledgedSubscriptions normalizes resourceSubscriptions in a
+// notifications/subscriptions/acknowledged params payload so the client sees
+// the gateway-namespaced URI array it subscribed with.
+//
+// Per the subscriptions SEP the field is a string[]. Some backends (notably
+// go-sdk) currently emit a boolean true instead; when that happens we
+// substitute clientURIs — the gateway-namespaced URIs this backend was asked
+// to honor — so the client can confirm what was acknowledged.
+func rewriteAcknowledgedSubscriptions(params json.RawMessage, backendName string, clientURIs []string) (json.RawMessage, bool) {
 	if len(params) == 0 {
 		return nil, false
 	}
@@ -1139,27 +1145,18 @@ func rewriteAcknowledgedSubscriptions(params json.RawMessage, backendName string
 	if !ok {
 		return nil, false
 	}
-	// The spec says resourceSubscriptions should echo the URI array, but some
-	// backends (e.g. go-sdk) send a boolean true instead. Try the array first;
-	// if that fails, pass through whatever the backend sent so the notification
-	// is not silently dropped — the client can still branch on the other fields.
+
 	var uris []string
-	if json.Unmarshal(urisRaw, &uris) != nil || len(uris) == 0 {
-		// Not a string array (boolean, null, empty) — no URIs to rewrite.
-		// Re-marshal the rest (other fields may have changed) and return.
-		notifsOut, err := json.Marshal(notifs)
-		if err != nil {
-			return nil, false
+	if json.Unmarshal(urisRaw, &uris) == nil && len(uris) > 0 {
+		// Backend echoed an array of upstream URIs — re-prefix for the client.
+		for i, uri := range uris {
+			uris[i] = downstreamResourceURI(uri, backendName)
 		}
-		m["notifications"] = notifsOut
-		out, err := json.Marshal(m)
-		if err != nil {
-			return nil, false
-		}
-		return out, true
-	}
-	for i, uri := range uris {
-		uris[i] = downstreamResourceURI(uri, backendName)
+	} else {
+		// Boolean true / null / empty / unexpected shape — substitute the
+		// client's gateway-namespaced URIs for this backend so the ack is
+		// still a string[] as the spec requires.
+		uris = append([]string(nil), clientURIs...)
 	}
 	prefixed, err := json.Marshal(uris)
 	if err != nil {
@@ -1176,6 +1173,20 @@ func rewriteAcknowledgedSubscriptions(params json.RawMessage, backendName string
 		return nil, false
 	}
 	return out, true
+}
+
+// resourceURIsForBackend returns the gateway-namespaced resource subscription
+// URIs from intent that belong to backendName, in stable order.
+func (intent subscriptionListenIntent) resourceURIsForBackend(backendName string) []string {
+	var uris []string
+	for uri := range intent.resourceURIs {
+		owner, _, err := upstreamResourceURI(uri)
+		if err == nil && owner == backendName {
+			uris = append(uris, uri)
+		}
+	}
+	sort.Strings(uris)
+	return uris
 }
 
 // rewriteUpdatedURI re-prefixes the "uri" field in a notifications/resources/updated

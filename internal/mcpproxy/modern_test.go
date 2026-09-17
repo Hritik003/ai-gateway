@@ -1656,7 +1656,7 @@ func TestHandleSubscriptionsListen_ForwardsCancelled(t *testing.T) {
 func TestRewriteAcknowledgedSubscriptions(t *testing.T) {
 	t.Run("re-prefixes resourceSubscriptions", func(t *testing.T) {
 		in := json.RawMessage(`{"notifications":{"resourceSubscriptions":["file:///a","file:///b"],"toolsListChanged":true}}`)
-		out, ok := rewriteAcknowledgedSubscriptions(in, "backend1")
+		out, ok := rewriteAcknowledgedSubscriptions(in, "backend1", nil)
 		require.True(t, ok)
 		var m map[string]json.RawMessage
 		require.NoError(t, json.Unmarshal(out, &m))
@@ -1671,14 +1671,31 @@ func TestRewriteAcknowledgedSubscriptions(t *testing.T) {
 		require.Equal(t, json.RawMessage(`true`), notifs["toolsListChanged"])
 	})
 
+	t.Run("boolean true substituted with client URIs", func(t *testing.T) {
+		clientURIs := []string{
+			downstreamResourceURI("file:///a", "backend1"),
+			downstreamResourceURI("file:///b", "backend1"),
+		}
+		in := json.RawMessage(`{"notifications":{"resourceSubscriptions":true,"toolsListChanged":true}}`)
+		out, ok := rewriteAcknowledgedSubscriptions(in, "backend1", clientURIs)
+		require.True(t, ok)
+		var m map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(out, &m))
+		var notifs map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(m["notifications"], &notifs))
+		var uris []string
+		require.NoError(t, json.Unmarshal(notifs["resourceSubscriptions"], &uris))
+		require.Equal(t, clientURIs, uris)
+	})
+
 	t.Run("empty params", func(t *testing.T) {
-		out, ok := rewriteAcknowledgedSubscriptions(nil, "backend1")
+		out, ok := rewriteAcknowledgedSubscriptions(nil, "backend1", nil)
 		require.False(t, ok)
 		require.Nil(t, out)
 	})
 
 	t.Run("missing notifications", func(t *testing.T) {
-		out, ok := rewriteAcknowledgedSubscriptions(json.RawMessage(`{}`), "backend1")
+		out, ok := rewriteAcknowledgedSubscriptions(json.RawMessage(`{}`), "backend1", nil)
 		require.False(t, ok)
 		require.Nil(t, out)
 	})
