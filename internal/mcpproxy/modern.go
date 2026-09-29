@@ -38,6 +38,10 @@ import (
 // backend set (e.g. nothing selected) or every selected backend failed.
 var errModernListNoBackends = errors.New("list request failed for all backends")
 
+// errBackendNotModern is returned when a backend answers server/discover the way
+// a pre-2026-07-28 server does.
+var errBackendNotModern = errors.New("backend does not support protocol version " + protocolVersion20260728)
+
 const (
 	defaultTTLMs      = 0
 	defaultCacheScope = "public"
@@ -61,6 +65,16 @@ type subscriptionListenIntent struct {
 // rather than being stringified into a text/plain 500 response.
 type backendJSONRPCError struct {
 	raw json.RawMessage
+}
+
+// backendStatusError is a non-200 HTTP reply from a backend.
+type backendStatusError struct {
+	status int
+	body   []byte
+}
+
+func (e *backendStatusError) Error() string {
+	return fmt.Sprintf("backend returned status %d: %s", e.status, e.body)
 }
 
 // serveModernPOST handles modern (2026-07-28) stateless POST requests.
@@ -322,6 +336,7 @@ func (m *mcpRequestContext) handleServerDiscover(ctx context.Context, w http.Res
 	}
 
 	var results []*mcp.DiscoverResult
+	notModern := false
 	for _, backend := range selectedBackends {
 		backendStartAt := time.Now()
 		result, err := m.discoverBackend(ctx, route, backend)
@@ -332,6 +347,7 @@ func (m *mcpRequestContext) handleServerDiscover(ctx context.Context, w http.Res
 				slog.String("error", err.Error()))
 			backendMetrics.RecordMethodErrorCount(ctx, req.Method, nil, metrics.MCPStatusError)
 			backendMetrics.RecordRequestErrorDuration(ctx, backendStartAt, errorType(err), nil)
+			notModern = notModern || errors.Is(err, errBackendNotModern)
 			continue
 		}
 		if span != nil {
@@ -340,6 +356,11 @@ func (m *mcpRequestContext) handleServerDiscover(ctx context.Context, w http.Res
 		backendMetrics.RecordMethodCount(ctx, req.Method, nil)
 		backendMetrics.RecordRequestDuration(ctx, backendStartAt, nil)
 		results = append(results, result)
+	}
+	// Client error only if every backend failed
+	if len(results) == 0 && notModern {
+		writeBackendNotModernError(w, req.ID)
+		return handlerResult{}, fmt.Errorf("%w: route %s", errBackendNotModern, route)
 	}
 	if len(results) == 0 {
 		m.l.Error("server/discover failed for all backends", slog.String("route", route))
@@ -368,6 +389,9 @@ func (m *mcpRequestContext) discoverBackend(ctx context.Context, route filterapi
 	}
 
 	resultRaw, err := m.sendModernRequest(ctx, req, route, backend)
+	if isLegacyDiscoverRejection(err) {
+		return nil, fmt.Errorf("%w: server/discover rejected: %w", errBackendNotModern, err)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("server/discover request failed: %w", err)
 	}
@@ -378,6 +402,64 @@ func (m *mcpRequestContext) discoverBackend(ctx context.Context, route filterapi
 	}
 
 	return &result, nil
+}
+
+// isLegacyDiscoverRejection reports whether err shows the backend does not speak
+// 2026-07-28. Only a DiscoverResult or a modern-only error code proves it does;
+// pre-2026-07-28 servers answer a session-less request with 400/404/405, or
+// reject server/discover as an unknown method.
+func isLegacyDiscoverRejection(err error) bool {
+	var bjErr *backendJSONRPCError
+	if errors.As(err, &bjErr) {
+		return !isModernProtocolErrorCode(jsonRPCErrorCode(bjErr.raw))
+	}
+	var statusErr *backendStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	switch statusErr.status {
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusMethodNotAllowed:
+		var body struct {
+			Error json.RawMessage `json:"error"`
+		}
+		_ = json.Unmarshal(statusErr.body, &body)
+		return !isModernProtocolErrorCode(jsonRPCErrorCode(body.Error))
+	}
+	return false
+}
+
+// jsonRPCErrorCode returns the code of a raw JSON-RPC error object, or 0.
+func jsonRPCErrorCode(raw json.RawMessage) int64 {
+	var obj struct {
+		Code int64 `json:"code"`
+	}
+	_ = json.Unmarshal(raw, &obj)
+	return obj.Code
+}
+
+// isModernProtocolErrorCode reports whether code is one of the errors only a
+// 2026-07-28 server emits.
+func isModernProtocolErrorCode(code int64) bool {
+	switch code {
+	case errCodeHeaderMismatch, errCodeMissingRequiredCapability, errCodeUnsupportedProtocolVersion:
+		return true
+	}
+	return false
+}
+
+// writeBackendNotModernError rejects server/discover when no backend on the
+// route speaks 2026-07-28. data.supported lists only legacy versions so clients
+// fall back to the initialize handshake.
+func writeBackendNotModernError(w http.ResponseWriter, id jsonrpc.ID) {
+	writeProtocolError(w, &protocolError{
+		Code:    errCodeUnsupportedProtocolVersion,
+		Message: fmt.Sprintf("Unsupported protocol version: %q is not supported by any backend on this route", protocolVersion20260728),
+		Data: &mcp.UnsupportedProtocolVersionData{
+			Supported: legacyProtocolVersions,
+			Requested: protocolVersion20260728,
+		},
+		HTTPStatus: http.StatusBadRequest,
+	}, &id)
 }
 
 func discoverParams() []byte {
@@ -1373,7 +1455,7 @@ func (m *mcpRequestContext) sendModernRequest(ctx context.Context, req *jsonrpc.
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("backend returned status %d: %s", resp.StatusCode, string(respBody))
+		return nil, &backendStatusError{status: resp.StatusCode, body: respBody}
 	}
 
 	respBody, err := io.ReadAll(resp.Body)

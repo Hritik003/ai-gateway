@@ -8,6 +8,7 @@ package mcpproxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -841,6 +842,132 @@ func TestSendModernRequest_JSONRPCError(t *testing.T) {
 	_, err := proxy.sendModernRequest(context.Background(), req, "test-route", proxy.routes["test-route"].backends["backend1"])
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "backend JSON-RPC error")
+}
+
+// legacyAwareBackendHandler answers like a pre-2026-07-28 server for backends in
+// legacy (400 on a request without Mcp-Session-Id) and delegates the rest.
+func legacyAwareBackendHandler(legacy map[string]bool, modern http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if legacy[r.Header.Get(internalapi.MCPBackendHeader)] {
+			http.Error(w, "Bad Request: missing session ID", http.StatusBadRequest)
+			return
+		}
+		modern.ServeHTTP(w, r)
+	})
+}
+
+// requireBackendNotModernResponse asserts rr carries the -32022 rejection that
+// steers clients back to the legacy initialize handshake.
+func requireBackendNotModernResponse(t *testing.T, rr *httptest.ResponseRecorder) {
+	t.Helper()
+	require.Equal(t, http.StatusBadRequest, rr.Code)
+	var envelope struct {
+		ID    string `json:"id"`
+		Error struct {
+			Code int                                `json:"code"`
+			Data mcp.UnsupportedProtocolVersionData `json:"data"`
+		} `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &envelope), rr.Body.String())
+	require.Equal(t, "1", envelope.ID)
+	require.Equal(t, errCodeUnsupportedProtocolVersion, envelope.Error.Code)
+	require.Equal(t, []string{"2025-11-25", "2025-06-18", "2025-03-26"}, envelope.Error.Data.Supported)
+	require.Equal(t, protocolVersion20260728, envelope.Error.Data.Requested)
+}
+
+func TestIsLegacyDiscoverRejection(t *testing.T) {
+	tests := []struct {
+		name   string
+		err    error
+		legacy bool
+	}{
+		{name: "legacy 400 plain text", err: &backendStatusError{status: http.StatusBadRequest, body: []byte("Bad Request: missing session ID")}, legacy: true},
+		{name: "legacy 404", err: &backendStatusError{status: http.StatusNotFound, body: []byte("session not found")}, legacy: true},
+		{name: "legacy 405", err: &backendStatusError{status: http.StatusMethodNotAllowed}, legacy: true},
+		{
+			name:   "legacy 400 JSON-RPC error with null id",
+			err:    &backendStatusError{status: http.StatusBadRequest, body: []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"Bad Request: Server not initialized"}}`)},
+			legacy: true,
+		},
+		{
+			name: "modern 400 with modern-only error code",
+			err:  &backendStatusError{status: http.StatusBadRequest, body: []byte(`{"jsonrpc":"2.0","id":"1","error":{"code":-32020,"message":"Header mismatch"}}`)},
+		},
+		{name: "server error is not an era signal", err: &backendStatusError{status: http.StatusBadGateway, body: []byte("upstream boom")}},
+		{name: "method not found means legacy", err: &backendJSONRPCError{raw: json.RawMessage(`{"code":-32601,"message":"nope"}`)}, legacy: true},
+		{name: "modern-only JSON-RPC error proves modern", err: &backendJSONRPCError{raw: json.RawMessage(`{"code":-32021,"message":"nope"}`)}},
+		{name: "transport error is not an era signal", err: errors.New("request failed: connection refused")},
+		{name: "no error", err: nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.legacy, isLegacyDiscoverRejection(tt.err))
+		})
+	}
+}
+
+func TestHandleServerDiscover_LegacyBackendSkipped(t *testing.T) {
+	respFn := func(_, _ string) any {
+		return mcp.DiscoverResult{SupportedVersions: []string{protocolVersion20260728}, Capabilities: &mcp.ServerCapabilities{}}
+	}
+	server := httptest.NewServer(legacyAwareBackendHandler(map[string]bool{"backend1": true}, modernBackendHandler(t, nil, nil, respFn)))
+	defer server.Close()
+
+	proxy := newTestMCPProxy()
+	proxy.backendListenerAddr = server.URL
+	rr := httptest.NewRecorder()
+
+	_, err := proxy.handleServerDiscover(context.Background(), rr, modernReq(t, "server/discover", nil), "test-route", nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.JSONEq(t, `["2026-07-28"]`, string(decodeResult(t, rr)["supportedVersions"]))
+}
+
+func TestHandleServerDiscover_AllLegacyRejectedWithUnsupportedVersion(t *testing.T) {
+	server := httptest.NewServer(legacyAwareBackendHandler(map[string]bool{"backend1": true, "backend2": true}, http.NotFoundHandler()))
+	defer server.Close()
+
+	proxy := newTestMCPProxy()
+	proxy.backendListenerAddr = server.URL
+	rr := httptest.NewRecorder()
+
+	_, err := proxy.handleServerDiscover(context.Background(), rr, modernReq(t, "server/discover", nil), "test-route", nil)
+	require.ErrorIs(t, err, errBackendNotModern)
+	requireBackendNotModernResponse(t, rr)
+}
+
+func TestHandleServerDiscover_JSONRPCRejection(t *testing.T) {
+	tests := []struct {
+		name      string
+		code      int
+		notModern bool
+	}{
+		{name: "method not found means legacy", code: -32601, notModern: true},
+		{name: "internal error means legacy", code: -32603, notModern: true},
+		{name: "modern-only error proves modern", code: errCodeMissingRequiredCapability},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var envelope struct {
+					ID json.RawMessage `json:"id"`
+				}
+				body, _ := io.ReadAll(r.Body)
+				require.NoError(t, json.Unmarshal(body, &envelope))
+				_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":%d,"message":"nope"}}`, envelope.ID, tt.code)
+			}))
+			defer server.Close()
+
+			proxy := newTestMCPProxy()
+			proxy.backendListenerAddr = server.URL
+			proxy.requestHeaders = http.Header{}
+			backend := proxy.routes["test-route"].backends["backend1"]
+
+			_, err := proxy.discoverBackend(context.Background(), "test-route", backend)
+			require.Error(t, err)
+			require.Equal(t, tt.notModern, errors.Is(err, errBackendNotModern), err.Error())
+		})
+	}
 }
 
 func TestSendModernRequest_NoResult(t *testing.T) {
@@ -2301,6 +2428,7 @@ func TestHandleModernToolsCall_AuthorizationAllowed(t *testing.T) {
 	proxy.backendListenerAddr = server.URL
 	proxy.routes["test-route"].authorization = mustCompileAuthorization(t, &filterapi.MCPRouteAuthorization{
 		DefaultAction: filterapi.AuthorizationActionDeny,
+		VerifiedJWT:   true,
 		Rules: []filterapi.MCPRouteAuthorizationRule{
 			{
 				Action: filterapi.AuthorizationActionAllow,

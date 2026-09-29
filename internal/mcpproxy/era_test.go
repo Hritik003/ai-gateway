@@ -106,7 +106,7 @@ func TestDetectClientEra_DeclaredVersion(t *testing.T) {
 		require.Equal(t, protocolVersion20260728, got.version)
 	})
 
-	for _, v := range []string{"2025-11-25", "2025-06-18"} {
+	for _, v := range []string{"2025-11-25", "2025-06-18", "2025-03-26"} {
 		t.Run("legacy version "+v+" routes to legacy validation", func(t *testing.T) {
 			r := newHTTPRequest(t, http.MethodPost, map[string]string{
 				mcpProtocolVersionHeader: v,
@@ -120,17 +120,23 @@ func TestDetectClientEra_DeclaredVersion(t *testing.T) {
 		})
 	}
 
-	t.Run("old unknown date version is treated as legacy", func(t *testing.T) {
-		r := newHTTPRequest(t, http.MethodPost, map[string]string{
-			mcpProtocolVersionHeader: "1999-01-01",
-			sessionIDHeader:          "sess",
+	for _, v := range []string{"1999-01-01", "2024-11-05", "2025-99-99", "2026-01-01"} {
+		t.Run("unknown pre-modern date "+v+" is rejected with unsupported protocol version", func(t *testing.T) {
+			r := newHTTPRequest(t, http.MethodPost, map[string]string{
+				mcpProtocolVersionHeader: v,
+				sessionIDHeader:          "sess",
+			})
+			msg := newRequestMsg(t, "tools/call", "id", nil)
+			got := detectClientEra(r, msg)
+			require.NotNil(t, got.err)
+			require.Equal(t, errCodeUnsupportedProtocolVersion, got.err.Code)
+			require.Equal(t, http.StatusBadRequest, got.err.HTTPStatus)
+			require.Equal(t, &mcp.UnsupportedProtocolVersionData{
+				Supported: []string{"2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"},
+				Requested: v,
+			}, got.err.Data)
 		})
-		msg := newRequestMsg(t, "tools/call", "id", nil)
-		got := detectClientEra(r, msg)
-		require.Nil(t, got.err)
-		require.Equal(t, eraLegacy, got.era)
-		require.Equal(t, "1999-01-01", got.version)
-	})
+	}
 
 	t.Run("future version is rejected with unsupported protocol version", func(t *testing.T) {
 		r := newHTTPRequest(t, http.MethodPost, map[string]string{

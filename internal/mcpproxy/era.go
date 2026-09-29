@@ -11,6 +11,7 @@ package mcpproxy
 import (
 	"fmt"
 	"net/http"
+	"slices"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -20,6 +21,8 @@ import (
 
 // Protocol version constants.
 const (
+	protocolVersion20250326 = "2025-03-26"
+	protocolVersion20251125 = "2025-11-25"
 	protocolVersion20260728 = "2026-07-28"
 
 	// Modern MCP headers (2026-07-28 spec).
@@ -48,6 +51,19 @@ const (
 	errCodeMissingRequiredCapability  = mcp.CodeMissingRequiredClientCapabilities // -32021
 	errCodeUnsupportedProtocolVersion = mcp.CodeUnsupportedProtocolVersion        // -32022
 )
+
+// legacyProtocolVersions are the pre-2026-07-28 versions a client may declare in
+// Mcp-Protocol-Version, newest first. 2024-11-05 is absent because it predates
+// Streamable HTTP and never sends the header.
+var legacyProtocolVersions = []string{
+	protocolVersion20251125,
+	protocolVersion20250618,
+	protocolVersion20250326,
+}
+
+// supportedProtocolVersions is advertised in data.supported of -32022 errors,
+// newest first.
+var supportedProtocolVersions = append([]string{protocolVersion20260728}, legacyProtocolVersions...)
 
 // legacyOnlyMethods were removed by the 2026-07-28 spec (SEP-2575). Seeing one
 // on a modern request means the client is mixing eras.
@@ -355,34 +371,21 @@ func validateHeaderVersion(reqDetails *requestDetails) eraDetection {
 		return eraDetection{err: &protocolError{
 			Code:       errCodeHeaderMismatch,
 			Message:    fmt.Sprintf("%s header is present but %s is missing; set %s to declare a protocol version", mcpMethodHeader, mcpProtocolVersionHeader, mcpProtocolVersionHeader),
-			Data:       &mcp.UnsupportedProtocolVersionData{Supported: []string{protocolVersion20260728}},
+			Data:       &mcp.UnsupportedProtocolVersionData{Supported: supportedProtocolVersions},
 			HTTPStatus: http.StatusBadRequest,
 		}}
 	}
-	// Future/malformed version → not a known legacy date, not modern.
-	if reqDetails.headerVersion != "" && !isLegacyVersion(reqDetails.headerVersion) {
+	// Anything other than a known legacy version → unsupported.
+	if reqDetails.headerVersion != "" && !slices.Contains(legacyProtocolVersions, reqDetails.headerVersion) {
 		return eraDetection{err: &protocolError{
 			Code:    errCodeUnsupportedProtocolVersion,
 			Message: fmt.Sprintf("Unsupported protocol version: %q", reqDetails.headerVersion),
 			Data: &mcp.UnsupportedProtocolVersionData{
-				Supported: []string{protocolVersion20260728},
+				Supported: supportedProtocolVersions,
 				Requested: reqDetails.headerVersion,
 			},
 			HTTPStatus: http.StatusBadRequest,
 		}}
 	}
 	return eraDetection{}
-}
-
-// isLegacyVersion reports whether v is a well-formed date-based protocol
-// version that predates the modern version (2026-07-28). The comparison is a
-// simple lexicographic string compare, which works correctly for ISO-8601
-// date strings (YYYY-MM-DD). Malformed strings that don't look like dates
-// return false so they fall through to the "unsupported version" error.
-func isLegacyVersion(v string) bool {
-	// Sanity check: must be a 10-char date string (YYYY-MM-DD).
-	if len(v) != 10 || v[4] != '-' || v[7] != '-' {
-		return false
-	}
-	return v < protocolVersion20260728
 }
